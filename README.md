@@ -157,7 +157,7 @@ Renaming a tab carries the pane title along because the card headline prefers th
 
 ### Version check and guided update
 
-The header subtitle always carries the installed version (`全局智能体调度 · AGENT 看板 · v1.2.0`, read from `herdr-plugin.toml`). When upstream is ahead, an amber `⬆ 更新 vX.Y.Z  U` button appears in the header; `U` does the same from the keyboard:
+The header subtitle always carries the installed version (`全局智能体调度 · AGENT 看板 · v1.3.0`, read from `herdr-plugin.toml`). When upstream is ahead, an amber `⬆ 更新 vX.Y.Z  U` button appears in the header; `U` does the same from the keyboard:
 
 - **Never blocks** — a background thread reads the upstream `herdr-plugin.toml` version at startup and caches it in `~/.cache/herdr-portal/version.json` (6h TTL). Rendering only reads that cache, so offline or rate-limited simply means no button, never a stalled frame
 - **Two presses before anything runs** — the first `U` only says `发现新版 vX.Y.Z（当前 vA.B.C）· 再按一次 U 执行 …`; the second one launches

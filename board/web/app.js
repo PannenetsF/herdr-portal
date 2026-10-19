@@ -402,7 +402,7 @@ async function load() {
       pendingSelect = null;
     }
   } catch (err) {
-    render({ ok: false, error: String(err), unauthorized: Boolean(err?.unauthorized), clock: new Date().toLocaleTimeString() });
+    render({ ok: false, error: String(err?.message || err), unauthorized: Boolean(err?.unauthorized), clock: new Date().toLocaleTimeString() });
   }
 }
 
