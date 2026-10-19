@@ -86,8 +86,21 @@ CLEANUP_THRESHOLD_LABELS = {0: "不限", 300: "5m", 1800: "30m", 7200: "2h"}
 DEFAULT_CLEANUP_IDLE = 1800
 
 _activity: dict[str, dict[str, Any]] = {}
+
 _activity_loaded = False
 _activity_saved_at = 0.0
+
+# ---------- 并发保护 ----------
+# server.py 是 ThreadingHTTPServer（每个请求一个线程），TUI 也有自己的后台采集线程，
+# 所以下面这些进程级 memo 必须串行访问：一把可重入锁保护 memo 的读—改—写。
+_MEMO_LOCK = threading.RLock()
+# 采集单飞：同一时刻只跑一次 collect()，TTL 内的并发请求复用同一份快照。
+# 没有它，1.5s 一次的网页轮询 + 1Hz 的 TUI + 并发压测会各跑一遍完整采集
+# （其中今日用量要解析几十个会话文件，实测 ~5s，全程吃 GIL）：请求互相排队，
+# 连 daemon 的启动健康检查都会超时。
+COLLECT_TTL = 1.0
+_collect_gate = threading.Lock()
+_collect_state: tuple[float, dict[str, Any]] | None = None
 
 
 def run_herdr(*args: str, timeout: float = 4.0, allow_empty: bool = False) -> dict[str, Any]:
@@ -290,6 +303,12 @@ def _tool_activity(tool: dict[str, Any], fallback: str = "") -> dict[str, Any]:
 
 
 def read_session_extra(session_path: str | None) -> dict[str, Any]:
+    """线程安全入口：解析结果缓存与子代理调用账本都在同一把 memo 锁里更新。"""
+    with _MEMO_LOCK:
+        return _read_session_extra(session_path)
+
+
+def _read_session_extra(session_path: str | None) -> dict[str, Any]:
     if not session_path:
         return {}
     path = Path(session_path)
@@ -748,39 +767,40 @@ def assign_color_slots(items: list[dict[str, Any]], now: float) -> None:
     所以两个看板进程从同一份磁盘状态出发会推导出同一个结果。
     """
     global _color_saved_at
-    records = _read_colors()
-    live_ids = sorted({str(item.get("pane_id") or "") for item in items} - {""})
-    live = set(live_ids)
-    by_id = {str(item.get("pane_id") or ""): item for item in items}
-    held: dict[int, int] = {}
-    for pane_id in live_ids:
-        record = records.get(pane_id)
-        if record is not None and 0 <= int(record.get("slot", -1)) < COLOR_SLOT_COUNT:
+    with _MEMO_LOCK:  # 读—改—写 colors.json：TUI 与 web 两个进程也靠它收敛
+        records = _read_colors()
+        live_ids = sorted({str(item.get("pane_id") or "") for item in items} - {""})
+        live = set(live_ids)
+        by_id = {str(item.get("pane_id") or ""): item for item in items}
+        held: dict[int, int] = {}
+        for pane_id in live_ids:
+            record = records.get(pane_id)
+            if record is not None and 0 <= int(record.get("slot", -1)) < COLOR_SLOT_COUNT:
+                slot = int(record["slot"])
+                held[slot] = held.get(slot, 0) + 1
+        assigned = False
+        for pane_id in live_ids:
+            record = records.get(pane_id)
+            if record is None or not 0 <= int(record.get("slot", -1)) < COLOR_SLOT_COUNT:
+                slot = min(range(COLOR_SLOT_COUNT), key=lambda n: held.get(n, 0))
+                record = {"slot": slot}
+                records[pane_id] = record
+                held[slot] = held.get(slot, 0) + 1
+                assigned = True
+            record["seen"] = now
             slot = int(record["slot"])
-            held[slot] = held.get(slot, 0) + 1
-    assigned = False
-    for pane_id in live_ids:
-        record = records.get(pane_id)
-        if record is None or not 0 <= int(record.get("slot", -1)) < COLOR_SLOT_COUNT:
-            slot = min(range(COLOR_SLOT_COUNT), key=lambda n: held.get(n, 0))
-            record = {"slot": slot}
-            records[pane_id] = record
-            held[slot] = held.get(slot, 0) + 1
-            assigned = True
-        record["seen"] = now
-        slot = int(record["slot"])
-        by_id[pane_id]["color_slot"] = slot
-        by_id[pane_id]["color_hue"] = COLOR_SLOTS[slot]["hue"]
-    stale = [
-        pane_id
-        for pane_id, record in records.items()
-        if pane_id not in live and now - float(record.get("seen") or 0.0) > COLOR_GRACE_SECONDS
-    ]
-    for pane_id in stale:
-        del records[pane_id]
-    if assigned or stale or now - _color_saved_at > 30.0:
-        _write_colors(records)
-        _color_saved_at = now
+            by_id[pane_id]["color_slot"] = slot
+            by_id[pane_id]["color_hue"] = COLOR_SLOTS[slot]["hue"]
+        stale = [
+            pane_id
+            for pane_id, record in records.items()
+            if pane_id not in live and now - float(record.get("seen") or 0.0) > COLOR_GRACE_SECONDS
+        ]
+        for pane_id in stale:
+            del records[pane_id]
+        if assigned or stale or now - _color_saved_at > 30.0:
+            _write_colors(records)
+            _color_saved_at = now
 
 
 def _fingerprint(snapshot: dict[str, Any]) -> str:
@@ -843,11 +863,12 @@ def collect() -> dict[str, Any]:
     items = [normalize_item(pane, workspaces, tabs, now) for pane in panes]
     items.sort(key=_pane_order_key)  # herdr 快照次序会抖动，排序后卡片位置在刷新间稳定
     track_pane_activity(panes, now)
-    for item in items:
-        since = (_activity.get(item.get("pane_id")) or {}).get("since")
-        item["quiet_since"] = since
-        item["quiet_seconds"] = int(max(0.0, now - since)) if since else 0
-        item["quiet_label"] = human_age(since, now)
+    with _MEMO_LOCK:
+        for item in items:
+            since = (_activity.get(item.get("pane_id")) or {}).get("since")
+            item["quiet_since"] = since
+            item["quiet_seconds"] = int(max(0.0, now - since)) if since else 0
+            item["quiet_label"] = human_age(since, now)
     assign_color_slots(items, now)
     counts = {
         "blocked": 0,
@@ -934,7 +955,26 @@ def collect() -> dict[str, Any]:
     }
 
 
-def collect_or_error() -> dict[str, Any]:
+def collect_or_error(ttl: float = COLLECT_TTL) -> dict[str, Any]:
+    """采集一份快照。TTL 内的并发调用复用同一份结果（单飞），异常照旧降级成 ok:false。
+
+    采集在 _collect_gate 上排队：同一时刻只有一个线程真的去跑 collect()，
+    其余线程等它出结果后直接复用，而不是各自再跑一遍（进而把 GIL 抢到互相超时）。
+    """
+    global _collect_state
+    cached = _collect_state
+    if cached is not None and ttl > 0 and time.time() - cached[0] < ttl:
+        return cached[1]
+    with _collect_gate:
+        cached = _collect_state
+        if cached is not None and ttl > 0 and time.time() - cached[0] < ttl:
+            return cached[1]
+        result = _collect_once()
+        _collect_state = (time.time(), result)
+        return result
+
+
+def _collect_once() -> dict[str, Any]:
     try:
         return collect()
     except Exception as exc:  # noqa: BLE001 - surface any collector failure to UI
@@ -989,8 +1029,10 @@ def send_text(pane_id: str, text: str) -> dict[str, Any]:
         run_herdr("agent", "prompt", pane_id, message, timeout=20)
         return {"path": "prompt", "agent": item["agent_label"], "title": item["title"]}
 
-    run_herdr("pane", "send-text", pane_id, message, timeout=10)
-    run_herdr("pane", "send-keys", pane_id, "enter", timeout=10)
+    # herdr 的 pane send-text / send-keys 成功时不打印任何东西（exit 0），
+    # 不带 allow_empty 会被 run_herdr 当成失败，文字已经送进 pane 却报错、enter 也不会按下去。
+    run_herdr("pane", "send-text", pane_id, message, timeout=10, allow_empty=True)
+    run_herdr("pane", "send-keys", pane_id, "enter", timeout=10, allow_empty=True)
     return {"path": "keys", "agent": item["agent_label"], "title": item["title"]}
 
 
@@ -1138,36 +1180,38 @@ def _activity_path() -> Path:
 def _load_activity() -> None:
     """进程内只读一次磁盘；之后以内存镜像为准（多个看板同时跑时各自收敛）。"""
     global _activity_loaded
-    if _activity_loaded:
-        return
-    _activity_loaded = True
-    try:
-        raw = json.loads(_activity_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if isinstance(raw, dict):
-        for pane_id, record in raw.items():
-            if isinstance(record, dict) and isinstance(record.get("since"), (int, float)):
-                _activity[str(pane_id)] = {
-                    "revision": record.get("revision"),
-                    "title": record.get("title") or "",
-                    "since": float(record["since"]),
-                }
+    with _MEMO_LOCK:
+        if _activity_loaded:
+            return
+        _activity_loaded = True
+        try:
+            raw = json.loads(_activity_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(raw, dict):
+            for pane_id, record in raw.items():
+                if isinstance(record, dict) and isinstance(record.get("since"), (int, float)):
+                    _activity[str(pane_id)] = {
+                        "revision": record.get("revision"),
+                        "title": record.get("title") or "",
+                        "since": float(record["since"]),
+                    }
 
 
 def _save_activity(now: float) -> None:
     global _activity_saved_at
-    if now - _activity_saved_at < 5.0:
-        return
-    _activity_saved_at = now
-    path = _activity_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(_activity, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    with _MEMO_LOCK:
+        if now - _activity_saved_at < 5.0:
+            return
+        _activity_saved_at = now
+        path = _activity_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(_activity, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
 
 def track_pane_activity(panes: list[dict[str, Any]], now: float) -> None:
@@ -1176,26 +1220,27 @@ def track_pane_activity(panes: list[dict[str, Any]], now: float) -> None:
     revision 是 herdr 的终端内容版本号：agent 跑动或用户敲字都会推进它，
     静止的 shell 则一直不变。看板每秒采集一次，所以这份记录足够精确。
     """
-    _load_activity()
-    dirty = False
-    live: set[str] = set()
-    for pane in panes:
-        pane_id = pane.get("pane_id")
-        if not pane_id:
-            continue
-        live.add(pane_id)
-        revision = pane.get("revision")
-        title = pane.get("terminal_title_stripped") or pane.get("terminal_title") or ""
-        record = _activity.get(pane_id)
-        if record and record.get("revision") == revision and record.get("title") == title:
-            continue
-        _activity[pane_id] = {"revision": revision, "title": title, "since": now}
-        dirty = True
-    for pane_id in [pane_id for pane_id in _activity if pane_id not in live]:
-        del _activity[pane_id]
-        dirty = True
-    if dirty:
-        _save_activity(now)
+    with _MEMO_LOCK:
+        _load_activity()
+        dirty = False
+        live: set[str] = set()
+        for pane in panes:
+            pane_id = pane.get("pane_id")
+            if not pane_id:
+                continue
+            live.add(pane_id)
+            revision = pane.get("revision")
+            title = pane.get("terminal_title_stripped") or pane.get("terminal_title") or ""
+            record = _activity.get(pane_id)
+            if record and record.get("revision") == revision and record.get("title") == title:
+                continue
+            _activity[pane_id] = {"revision": revision, "title": title, "since": now}
+            dirty = True
+        for pane_id in [pane_id for pane_id in _activity if pane_id not in live]:
+            del _activity[pane_id]
+            dirty = True
+        if dirty:
+            _save_activity(now)
 
 
 def _process_info(pane_id: str) -> dict[str, Any] | None:
@@ -1366,8 +1411,9 @@ def cleanup_apply(pane_ids: list[str], idle_seconds: int = DEFAULT_CLEANUP_IDLE)
             closed.append(pane_id)
         except Exception as exc:  # noqa: BLE001 - 单个 pane 失败不影响其余
             failed.append({"pane_id": pane_id, "error": str(exc)})
-    for pane_id in closed:
-        _activity.pop(pane_id, None)
+    with _MEMO_LOCK:
+        for pane_id in closed:
+            _activity.pop(pane_id, None)
 
     after = collect_or_error()
     after_items = after.get("items") or []
@@ -1606,12 +1652,13 @@ def version_status(refresh: bool = False) -> dict[str, Any]:
 def start_version_check() -> None:
     """缓存过期时后台查一次；看板第一帧不等网络。"""
     global _version_worker
-    if _version_worker is not None and _version_worker.is_alive():
-        return
-    if not version_status()["stale"]:
-        return
-    _version_worker = threading.Thread(target=fetch_latest_version, name="portal-version", daemon=True)
-    _version_worker.start()
+    with _MEMO_LOCK:
+        if _version_worker is not None and _version_worker.is_alive():
+            return
+        if not version_status()["stale"]:
+            return
+        _version_worker = threading.Thread(target=fetch_latest_version, name="portal-version", daemon=True)
+        _version_worker.start()
 
 
 def update_plan() -> dict[str, Any]:
@@ -1746,6 +1793,15 @@ def _parse_usage_file(family: str, path: Path) -> dict[str, Any]:
 
 
 def usage_summary() -> dict[str, Any]:
+    """线程安全入口：用量 memo 与逐文件解析缓存一起读写在 memo 锁里。
+
+    冷启动扫一遍今日会话实测 ~5s，所以同一时刻只允许一份在算。
+    """
+    with _MEMO_LOCK:
+        return _usage_summary()
+
+
+def _usage_summary() -> dict[str, Any]:
     """今日各模型用量（token 输入/输出 + 成本），带 TTL 缓存。"""
     global _usage_memo, _usage_memo_at
     now = time.time()
@@ -1819,6 +1875,12 @@ def _win_label(window_label: str) -> str:
 
 
 def plan_summary() -> dict[str, Any]:
+    """线程安全入口：套餐 memo 同样是进程级共享状态。"""
+    with _MEMO_LOCK:
+        return _plan_summary()
+
+
+def _plan_summary() -> dict[str, Any]:
     """各供应商套餐窗口的用量/余量（来自 omp auth-broker 采样的 usage_history）。
 
     每条记录含 used_fraction（已用比例）：0=完全未用，1=已耗尽。

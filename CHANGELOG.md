@@ -30,3 +30,22 @@ TUI 采集搬进后台线程，守护进程不再可能误杀无关进程。条�
 - **今日用量面板**：`M` 打开模型维度的 token / 成本表 + 各供应商套餐余量条，成本分档高亮、负荷配色；
   网页顶栏同步显示今日 token 与成本读数，卡片角标补供应商 / 模型 / `⧉Sub Agent` 数。
 - **后台子代理识别**：主 agent 让出控制权但子会话仍在写盘时，卡片显示「后台执行中 · N」，不再误报已完成。
+
+### 稳定性
+
+**采集层全局缓存并发不安全（P0-2，高危）**
+
+- 问题：`board/server.py` 是 `ThreadingHTTPServer`（每个请求一个线程），而 `board/collect.py` 里
+  `_session_cache`、`_SUBAGENT_OPEN` / `_SUBAGENT_SEEN_CALLS`、`_activity`、`_usage_memo` /
+  `_file_usage_cache`、`_plan_memo`、颜色槽位状态全是无锁模块级全局：并发请求互相踩
+  （丢子代理计数、读到半成品缓存、颜色槽位打架）。
+- 方案：一把可重入锁 `_MEMO_LOCK` 保护这些 memo 的读—改—写（嵌套调用靠 RLock 免死锁）；
+  采集加「单飞 + 1s TTL」——同一时刻只有一个线程真的跑 `collect()`，其余线程复用同一份快照。
+  没有它，1.5s 一次的网页轮询 + 1Hz 的 TUI + 并发请求会各跑一遍完整采集（今日用量扫描实测 ~5s，
+  全程占着 GIL），请求互相排队到超时；另外把监听队列 backlog 从 5 提到 128
+  （并发时 accept 抢不到 GIL，队列一满内核直接 RST，请求白丢）。磁盘状态仍是原子写 `os.replace`。
+- 验证：20 线程 × 200 次 `/api/snapshot` 并发压测，同时另开一个 TUI 进程：
+  4000/4000 全部 `200` 且结构自洽（`total == len(items)`、`windows + agents == total`、
+  状态计数之和 == `agents`、`pane_id` 不重复、`color_slot ∈ 0..7`、`quiet_seconds ≥ 0`），
+  `server.log` 无 traceback、进程未重启；压测结束后 TUI 仍存活，方向键 0.79s 内重绘、`q` 0.20s 退出。
+  调整 backlog 之前，同样的压测有 1164 次 `Connection reset by peer`。

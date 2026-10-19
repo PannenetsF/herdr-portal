@@ -105,6 +105,10 @@ def load_token() -> str:
 class PortalServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # 默认 backlog 只有 5：并发压测时 accept 抢不到 GIL，队列一满内核直接 RST，
+    # 客户端看到 "Connection reset by peer"。服务器自己没报错、也没坏数据，
+    # 但请求白丢——所以把队列放宽，让突发连接先排上。
+    request_queue_size = 128
 
 
 class Handler(BaseHTTPRequestHandler):
