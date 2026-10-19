@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:  # 事故 / 排队被取消时可以手动重跑，不必再推提交
 
 jobs:
   test:
@@ -14,8 +15,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.9", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Syntax check
