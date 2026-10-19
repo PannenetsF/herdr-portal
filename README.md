@@ -254,11 +254,16 @@ board/
   collect.py      # collects herdr snapshots + parses sessions
   server.py       # local web service
   daemon.py       # service supervisor (runs detached from the Herdr popup)
+  logutil.py      # runtime dir + opt-in debug logging (HERDR_PORTAL_DEBUG)
   web/            # web frontend (vanilla JS, zero dependencies)
+tests/            # unittest suite for the pure logic (stdlib only, no herdr needed)
 scripts/
   open-board.sh   # open the TUI (plugin pane overlay)
   open-web.sh     # start the web service and open/reuse a browser tab
 ```
+
+Tests: `python3 -m unittest discover -s tests` — fixtures only, they never touch a real herdr session
+or your state dir. CI runs them (plus `py_compile` and `bash -n`) on Linux and macOS with Python 3.9 and 3.13.
 
 ## Requirements
 

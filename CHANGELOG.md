@@ -100,3 +100,18 @@ TUI 采集搬进后台线程，守护进程不再可能误杀无关进程。条�
   `[herdr-portal] 读取会话文件失败 /tmp/dbg-session/broken.jsonl` 与完整 `PermissionError` 堆栈；
   不设该变量时 stderr 为 0 字节、退出码 0，看板数据与之前完全一致（blocked 卡片照常渲染）；
   TUI 在 debug 模式下把同样的堆栈写进 `tui-debug.log`，屏幕上没有任何多余输出。
+
+### 测试与 CI
+
+**纯逻辑没有回归网（P2-7）**
+
+- 问题：`normalize_item` / `build_activity` / `classify_window` / 静默判定 / `send_text` 分支这些
+  纯逻辑没有任何测试，改一行就可能悄悄改掉卡片语义；也没有 CI 兜底。
+- 方案：新增 `tests/test_collect.py`（27 个用例，标准库 unittest，全部 fixture：临时目录 + 假会话文件 +
+  `mock.patch` 掉 `run_herdr` / `collect`），覆盖窗口与 Agent 卡片的归一化、会话里的模型/供应商/
+  用量/子代理账本、后台子代理升级「后台执行中」、静默计时（revision 变才重新计时、消失即清理、落盘）、
+  `send_text` 的两条分支与三类拒绝路径、pane_id 自然排序；另加 `.github/workflows/ci.yml`，
+  在 Linux + macOS 上用 Python 3.9 / 3.13 跑 `python3 -m py_compile board/*.py`、
+  `bash -n scripts/*.sh` 与 `python3 -m unittest discover -s tests`。
+- 验证：本机 Python 3.14.7 与系统 Python 3.9.6 上 `python3 -m unittest discover -s tests`
+  均 27 passed；`py_compile` 两个版本都通过；workflow 的 YAML 用 `YAML.load_file` 解析校验通过。

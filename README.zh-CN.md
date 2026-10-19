@@ -249,17 +249,21 @@ herdr server reload-config
 
 结构：
 
-```
 board/
   tui.py          # curses TUI 看板（键盘 + 鼠标）
   collect.py      # 采集 herdr snapshot + 会话解析
   server.py       # 本地网页服务
   daemon.py       # 服务进程管理（脱离 Herdr popup 运行）
+  logutil.py      # 运行时目录 + 可选调试日志（HERDR_PORTAL_DEBUG）
   web/            # 网页前端（原生 JS，零依赖）
+tests/            # 纯逻辑的 unittest（只用标准库，不需要真实 herdr）
 scripts/
   open-board.sh   # 打开 TUI（plugin pane overlay）
   open-web.sh     # 启动网页服务并打开/复用浏览器标签
 ```
+
+跑测试：`python3 -m unittest discover -s tests` —— 全部 fixture，不碰真实 herdr 会话与你的状态目录；
+CI 在 Linux / macOS 上用 Python 3.9 与 3.13 各跑一遍（另含 `py_compile` 与 `bash -n`）。
 
 ## 要求
 
