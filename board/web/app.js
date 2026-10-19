@@ -37,6 +37,39 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
+/* ---------- 本机 token ---------- */
+
+const TOKEN_KEY = "herdr-portal-token";
+
+// token 只出现在首次打开的 URL 上（open-web.sh 带过来）：存进 sessionStorage 后立刻从地址栏抹掉。
+function readToken() {
+  let stored = "";
+  try {
+    stored = sessionStorage.getItem(TOKEN_KEY) || "";
+  } catch {
+    stored = ""; // 隐私模式 / 禁用存储：本次页面会话继续用 URL 里那一份
+  }
+  if (!urlParams.has("token")) return stored;
+  const fromUrl = urlParams.get("token") || "";
+  try {
+    sessionStorage.setItem(TOKEN_KEY, fromUrl);
+  } catch {
+    stored = fromUrl;
+  }
+  const rest = new URLSearchParams(urlParams);
+  rest.delete("token");
+  const query = rest.toString();
+  history.replaceState(null, "", location.pathname + (query ? `?${query}` : "") + location.hash);
+  return stored || fromUrl;
+}
+
+// 所有 /api/* 都要带 token，不带只有 403。
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (TOKEN) headers.set("X-Herdr-Portal-Token", TOKEN);
+  return fetch(url, { ...options, headers });
+}
+
 function esc(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -44,6 +77,10 @@ function esc(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
 }
+
+// 支持 URL 参数：?view=windows 直接打开窗口视图；?select=<pane_id> 自动选中并展开回复区
+const urlParams = new URLSearchParams(location.search);
+const TOKEN = readToken();
 
 function matches(item) {
   if (state.family === "all") return true;
@@ -302,14 +339,17 @@ function restoreScroll(positions) {
 
 function render(snapshot, force = false) {
   if (snapshot.ok === false) {
-    state.online = false;
-    if (state.snapshot?.ok) {
+    const unauthorized = Boolean(snapshot.unauthorized);
+    if (state.snapshot?.ok && !unauthorized) {
       markOffline(snapshot.error || "采集失败");
       return;
     }
     $("clock").textContent = snapshot.clock || "--:--:--";
     markOffline(snapshot.error || "无法读取 Herdr 状态");
-    $("stage").innerHTML = `<div class="error">${esc(snapshot.error || "无法读取 Herdr 状态")}<br><small>看板会自动重连</small></div>`;
+    const hint = unauthorized
+      ? "请从 Herdr 里重新打开网页看板（Ctrl+B Shift+A）"
+      : "看板会自动重连";
+    $("stage").innerHTML = `<div class="error">${esc(snapshot.error || "无法读取 Herdr 状态")}<br><small>${esc(hint)}</small></div>`;
     return;
   }
 
@@ -348,7 +388,12 @@ function render(snapshot, force = false) {
 
 async function load() {
   try {
-    const res = await fetch("/api/snapshot", { cache: "no-store" });
+    const res = await apiFetch("/api/snapshot", { cache: "no-store" });
+    if (res.status === 401 || res.status === 403) {
+      const denied = new Error("未授权：本机看板需要一个有效 token");
+      denied.unauthorized = true;
+      throw denied;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const snapshot = await res.json();
     render(snapshot);
@@ -357,12 +402,12 @@ async function load() {
       pendingSelect = null;
     }
   } catch (err) {
-    render({ ok: false, error: String(err), clock: new Date().toLocaleTimeString() });
+    render({ ok: false, error: String(err), unauthorized: Boolean(err?.unauthorized), clock: new Date().toLocaleTimeString() });
   }
 }
 
 async function focusPane(paneId) {
-  await fetch("/api/focus", {
+  await apiFetch("/api/focus", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pane_id: paneId }),
@@ -487,7 +532,7 @@ async function sendMessage() {
   $("composer-input").disabled = true;
   setHint("发送中…");
   try {
-    const res = await fetch("/api/send", {
+    const res = await apiFetch("/api/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pane_id: item.pane_id, text }),
@@ -517,7 +562,7 @@ function autosize() {
 /* ---------- 释放闲置 Pane ---------- */
 
 async function fetchCleanup(idle) {
-  const res = await fetch(`/api/cleanup?idle=${encodeURIComponent(idle)}`, { cache: "no-store" });
+  const res = await apiFetch(`/api/cleanup?idle=${encodeURIComponent(idle)}`, { cache: "no-store" });
   const payload = await res.json();
   if (!res.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${res.status}`);
   return payload;
@@ -759,7 +804,7 @@ async function applyCleanup() {
   applyBtn.disabled = true;
   applyBtn.textContent = "释放中…";
   try {
-    const res = await fetch("/api/cleanup", {
+    const res = await apiFetch("/api/cleanup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pane_ids: paneIds, idle_seconds: state.cleanup.threshold }),
@@ -953,7 +998,6 @@ if (intro) {
 /* ---------- 启动 ---------- */
 
 // 支持 URL 参数：?view=windows 直接打开窗口视图；?select=<pane_id> 自动选中并展开回复区
-const urlParams = new URLSearchParams(location.search);
 if (urlParams.get("view") === "windows") {
   state.view = "windows";
   state.family = "all";

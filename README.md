@@ -202,6 +202,24 @@ Inside the rename panel: `Tab` switch target · `←→` move the cursor · `Ctr
 | Bottom-left *light / dark / neon / command* | Switch theme (command by default, choice remembered) |
 | *Board / Workspaces / Windows* | Switch view |
 
+### Local service authorization
+
+The web board is served by `board/server.py` on `127.0.0.1:8787`, and every `/api/*` call is gated:
+
+- **Token** — generated on first start (`secrets.token_urlsafe(32)`) and written to `$HERDR_PORTAL_RUNTIME/token` (default `~/.local/state/herdr-portal/token`, mode `0600`). `open-web.sh` passes it to the browser as `?token=…`; the page moves it into `sessionStorage` and wipes it from the address bar right away. Every API request then has to carry `X-Herdr-Portal-Token`. Delete the file to rotate the token, then reopen the board from Herdr.
+- **Host** — must be `127.0.0.1:<port>` or `localhost:<port>` (plus whatever `HERDR_PORTAL_HOST` is set to). A rebinding name like `evil.example:8787` gets `403`.
+- **Same origin** — a `POST` carrying an `Origin` / `Referer` from anywhere else gets `403`. Without this, any page you happen to visit could POST a prompt into an agent or close panes/tabs: those are "simple requests" that no preflight stops.
+
+```bash
+token=$(cat ~/.local/state/herdr-portal/token)
+curl -s -H "X-Herdr-Portal-Token: $token" http://127.0.0.1:8787/api/snapshot | head -c 200
+curl -s -X POST http://127.0.0.1:8787/api/cleanup            # 403 — no token
+```
+
+`/healthz` is the only open route (no token, loopback only): the supervisor probes liveness there instead of running a full collection.
+
+This is a local tool. `HERDR_PORTAL_HOST` exists for edge cases, but do not point it at `0.0.0.0` — the token keeps *browsers on this machine* honest, it is not transport security for your network.
+
 ## Use cases
 
 - **Watching parallel projects** — several agents running in different workspaces; the board shows who is working and who is waiting, and one keystroke or click puts you there
@@ -214,9 +232,11 @@ Inside the rename panel: `Tab` switch target · `←→` move the cursor · `Ctr
 | Variable | Effect |
 | --- | --- |
 | `HERDR_PORTAL_PORT` | Web port (default 8787) |
+| `HERDR_PORTAL_HOST` | Bind address and allowed `Host` (default `127.0.0.1`; keep it loopback) |
+| `HERDR_PORTAL_RUNTIME` | Runtime dir for token / pid / log (default `~/.local/state/herdr-portal`) |
 | `HERDR_PORTAL_NO_FRONT=1` | Do not raise the terminal window when a card is clicked |
 
-Service control: `python3 board/daemon.py start|stop|restart|status` (the plugin starts the web service on demand; logs live in `~/.local/state/herdr-portal/server.log`).
+Service control: `python3 board/daemon.py start|stop|restart|status` (the plugin starts the web service on demand). Pid, token and `server.log` live in `$HERDR_PORTAL_RUNTIME` (default `~/.local/state/herdr-portal`); `stop` refuses to kill a pid whose command line is not this plugin's `server.py`.
 
 ## Local development
 

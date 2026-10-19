@@ -20,7 +20,8 @@ PID_FILE = RUNTIME / "server.pid"
 LOG_FILE = RUNTIME / "server.log"
 HOST = os.environ.get("HERDR_PORTAL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HERDR_PORTAL_PORT", "8787"))
-URL = f"http://{HOST}:{PORT}/api/snapshot"
+# 探活用 /healthz：常量级响应，不触发采集，也不需要 token
+HEALTH_URL = f"http://{HOST}:{PORT}/healthz"
 
 
 def read_pid() -> int | None:
@@ -40,12 +41,15 @@ def process_alive(pid: int | None) -> bool:
         return False
 
 
-def healthy(timeout: float = 0.5) -> bool:
+def healthy(timeout: float = 1.0) -> bool:
+    """服务在不在？只问 /healthz —— 别拿 /api/snapshot 当探针：
+    那会跑一次完整采集（冷启动实测数秒），守护进程会把「正在采集」误判成启动失败。"""
+    request = urllib.request.Request(HEALTH_URL, headers={"User-Agent": "herdr-portal-daemon"})
     try:
-        with urllib.request.urlopen(URL, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
-            return response.status == 200 and isinstance(payload, dict)
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+            return response.status == 200 and bool(payload.get("ok"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError):
         return False
 
 
@@ -80,7 +84,10 @@ def start() -> int:
         log.close()
     PID_FILE.write_text(f"{process.pid}\n")
 
-    for _ in range(30):
+    # /api/snapshot 要跑一次真实采集（冷启动 / 机器有负载时 >0.5s），
+    # 所以按总时限轮询，而不是固定次数 × 过短的超时。
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
         if healthy():
             print(f"started {process.pid} http://{HOST}:{PORT}/")
             return 0

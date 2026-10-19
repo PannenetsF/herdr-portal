@@ -202,6 +202,24 @@ TUI 以键盘为主，但不是只能用键盘：
 | 左侧底部「浅色 / 深色 / 霓虹 / 指挥」 | 四种主题切换（默认指挥，记忆选择） |
 | 「状态看板 / 工作区 / 窗口」 | 三种视图切换 |
 
+### 本机服务鉴权
+
+网页看板由 `board/server.py` 在 `127.0.0.1:8787` 上提供，所有 `/api/*` 都要过三道闸：
+
+- **Token**：首次启动时生成（`secrets.token_urlsafe(32)`）并写入 `$HERDR_PORTAL_RUNTIME/token`（默认 `~/.local/state/herdr-portal/token`，权限 0600）。`open-web.sh` 会把它带在 `?token=…` 上打开浏览器，前端读完立刻存进 `sessionStorage` 并从地址栏抹掉；之后每个 API 请求都要带 `X-Herdr-Portal-Token`。删掉该文件即轮换 token，再从 Herdr 重新打开看板即可。
+- **Host**：必须是 `127.0.0.1:<端口>` 或 `localhost:<端口>`（以及 `HERDR_PORTAL_HOST` 指定的地址）。DNS rebinding 的域名（如 `evil.example:8787`）直接 403。
+- **同源**：`POST` 若带 `Origin` / `Referer`，来源不同一律 403。没有这道闸，你随手打开的任意网页都能 POST 一个提示词进 Agent、或者关掉 Pane / Tab —— 这些是「简单请求」，浏览器不会为它发预检。
+
+```bash
+token=$(cat ~/.local/state/herdr-portal/token)
+curl -s -H "X-Herdr-Portal-Token: $token" http://127.0.0.1:8787/api/snapshot | head -c 200
+curl -s -X POST http://127.0.0.1:8787/api/cleanup            # 403 —— 没带 token
+```
+
+`/healthz` 是唯一开放的路径（不要 token，仅限回环）：守护进程用它探活，不去跑一次完整采集。
+
+这是本机工具：`HERDR_PORTAL_HOST` 只为特殊场景保留，**不要把它设成 `0.0.0.0`** —— token 防的是本机浏览器，不是网络层安全。
+
 ## 使用场景
 
 - **多项目并行监控**：几个 Agent 同时跑在不同 workspace，看板一眼看清谁在执行、谁在等你，一下按键或一次点击直达现场
@@ -214,9 +232,12 @@ TUI 以键盘为主，但不是只能用键盘：
 | 变量 | 作用 |
 | --- | --- |
 | `HERDR_PORTAL_PORT` | 网页端口（默认 8787） |
+| `HERDR_PORTAL_HOST` | 监听地址与允许的 `Host`（默认 `127.0.0.1`，保持回环） |
+| `HERDR_PORTAL_RUNTIME` | 运行时目录（token / pid / 日志，默认 `~/.local/state/herdr-portal`） |
 | `HERDR_PORTAL_NO_FRONT=1` | 点击卡片时不让终端窗口弹到前台 |
 
-服务管理：`python3 board/daemon.py start|stop|restart|status`（网页服务由插件自动拉起，日志在 `~/.local/state/herdr-portal/server.log`）。
+服务管理：`python3 board/daemon.py start|stop|restart|status`（网页服务由插件自动拉起）。pid、token 与 `server.log` 都在 `$HERDR_PORTAL_RUNTIME`（默认 `~/.local/state/herdr-portal`）；`stop` 发现 pid 的命令行不是本插件的 `server.py` 会拒绝杀，并说明原因。
+
 
 ## 本地开发
 

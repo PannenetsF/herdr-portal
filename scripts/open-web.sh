@@ -5,11 +5,22 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 host="${HERDR_PORTAL_HOST:-127.0.0.1}"
 port="${HERDR_PORTAL_PORT:-8787}"
 url="http://${host}:${port}/"
+runtime="${HERDR_PORTAL_RUNTIME:-$HOME/.local/state/herdr-portal}"
 if ! python3 "$root/board/daemon.py" start; then
   echo "看板服务启动失败。"
-  echo "日志: ~/.local/state/herdr-portal/server.log"
-  tail -n 20 ~/.local/state/herdr-portal/server.log 2>/dev/null || true
+  echo "日志: $runtime/server.log"
+  tail -n 20 "$runtime/server.log" 2>/dev/null || true
   exit 1
+fi
+
+# /api/* 需要 token：读出来带进 URL（前端读一次就存 sessionStorage、把地址栏里的抹掉）
+token=""
+if [ -r "$runtime/token" ]; then
+  IFS= read -r token < "$runtime/token" || token=""
+fi
+open_url="$url"
+if [ -n "$token" ]; then
+  open_url="${url}?token=${token}"
 fi
 
 if [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
@@ -29,7 +40,7 @@ tell application \"Google Chrome\"
     if found then exit repeat
   end repeat
   if not found then
-    open location \"${url}\"
+    open location \"${open_url}\"
   end if
   activate
 end tell" >/dev/null 2>&1; then
