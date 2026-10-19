@@ -418,6 +418,12 @@ def build_activity(
         phase = "等待确认"
         title = headline or tool_title or "等待你的输入或授权"
         active = True
+    elif status == "unknown":
+        # agent 已识别但生命周期状态尚未上报：归入执行中视图并保持 active，
+        # 既不丢卡也不当成空闲（状态未明时按活跃对待最安全）。
+        phase = "状态未知"
+        title = headline or tool_title or session_title or fallback_title
+        active = True
     elif status == "working" and extra.get("tool_pending"):
         phase = extra.get("tool_phase") or "正在执行"
         title = tool_title or headline or session_title or fallback_title
@@ -468,7 +474,10 @@ def normalize_item(
         meta = AGENT_META.get(agent, {"label": str(agent).upper(), "family": "other"})
         agent_label = meta["label"]
         family = meta["family"]
-        column = status if status in STATUS_META else "unknown"
+        # unknown（agent 已识别但状态尚未上报）归入执行中列：collect() 只构建
+        # blocked/working/settled/window，直接用 unknown 会让这张卡不属于任何
+        # 列而消失，多 agent tab 里刚启动的那个 agent 就看不到了。
+        column = status if status in ("blocked", "working", "idle", "done") else "working"
         status_label = STATUS_META.get(status, STATUS_META["unknown"])["label"]
 
     pane_title = str(pane.get("label") or "").strip()
@@ -969,8 +978,9 @@ def _reclaim_verdict(
     if _is_portal_pane(info):
         return "protected", "", "看板自身", process_label
     if item.get("kind") == "agent":
-        if item.get("status") in {"working", "blocked"}:
-            return "protected", "", "Agent 运行中", process_label
+        if item.get("status") in {"working", "blocked", "unknown"}:
+            # unknown = 状态尚未上报（刚启动），不能当成空闲 Agent 回收。
+            return "protected", "", "Agent 运行中" if item.get("status") != "unknown" else "Agent 状态未知", process_label
         return "candidate", "agent", "空闲 Agent", process_label
     if not shell_only:
         return "protected", "", f"运行中 · {process_label}", process_label
