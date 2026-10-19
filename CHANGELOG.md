@@ -49,3 +49,13 @@ TUI 采集搬进后台线程，守护进程不再可能误杀无关进程。条�
   状态计数之和 == `agents`、`pane_id` 不重复、`color_slot ∈ 0..7`、`quiet_seconds ≥ 0`），
   `server.log` 无 traceback、进程未重启；压测结束后 TUI 仍存活，方向键 0.79s 内重绘、`q` 0.20s 退出。
   调整 backlog 之前，同样的压测有 1164 次 `Connection reset by peer`。
+
+**TUI 采集阻塞渲染（P1-3，中）**
+
+- 问题：`board/tui.py` 主循环每次刷新都在渲染线程里同步跑 `collect_or_error()`——里面有 4s 超时的
+  herdr 调用、会话文件读取与今日用量扫描，herdr 一慢整屏卡住，连按 `q` / 方向键都要等采集跑完。
+- 方案：新增 `SnapshotFeed`，守护线程按 1Hz 采集（复用 `COLLECT_TTL` 窗口），主循环只渲染最新一份快照；
+  首帧没有数据时渲染空列 + 表头「采集中…」；`R` 键与动作后的 `refresh(force=True)` 用 `kick()`
+  叫醒采集线程立刻补采一次，按键处理不再依赖采集完成。
+- 验证：把 herdr 换成 `sleep 3` 的桩（`HERDR_BIN_PATH`），首帧数据到位后连按 12 次方向键：
+  旧版最差 4.90s 才有反应、按 `q` 要 4.54s 才退出；新版最差 0.13s、`q` 0.22s 退出（两者中位数均 0.03s）。

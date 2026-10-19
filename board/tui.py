@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -26,6 +27,7 @@ if str(ROOT) not in sys.path:
 from collect import (  # noqa: E402
     CLEANUP_THRESHOLD_LABELS,
     CLEANUP_THRESHOLDS,
+    COLLECT_TTL,
     COLOR_SLOTS,
     COLOR_SLOT_COUNT,
     DEFAULT_CLEANUP_IDLE,
@@ -349,9 +351,52 @@ def _scrollbar_geometry(track_top: int, track_bottom: int, visible: int, total: 
     return thumb, thumb_start
 
 
+class SnapshotFeed:
+    """后台按 1Hz 采集快照：主循环只渲染最新那一份，按键永远不等采集。
+
+    collect_or_error() 里有 4s 超时的 herdr 调用、会话文件读取和今日用量扫描，
+    同步跑在渲染循环里就会整屏卡住（herdr 一慢就是几百毫秒到几秒）；
+    首帧还没数据时看板渲染空列 + 「采集中…」，采集本身跑在这个守护线程里。
+    """
+
+    def __init__(self, interval: float = 1.0) -> None:
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._snapshot: dict | None = None
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="portal-collect", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def latest(self) -> dict | None:
+        with self._lock:
+            return self._snapshot
+
+    def kick(self) -> None:
+        """按 R 时叫醒采集线程立刻采一次（绕过 1s 复用窗口）。"""
+        self._wake.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            kicked = self._wake.is_set()
+            self._wake.clear()
+            snapshot = collect_or_error(ttl=0.0 if kicked else COLLECT_TTL)
+            if snapshot is not None:
+                with self._lock:
+                    self._snapshot = snapshot
+            self._wake.wait(self.interval)  # 被 kick / stop 叫醒就立刻再来一轮
+
+
 class Board:
-    def __init__(self, stdscr: curses.window) -> None:
+    def __init__(self, stdscr: curses.window, feed: SnapshotFeed) -> None:
         self.stdscr = stdscr
+        self.feed = feed
         self.snapshot: dict = {}
         self.view = "agents"  # "agents" | "windows"
         self.pos = {"agents": [1, 0], "windows": [0, 0]}
@@ -446,19 +491,23 @@ class Board:
         return False
 
     def refresh(self, force: bool = False) -> None:
+        """取后台线程最新的快照来渲染；force（R / 动作后）额外催一次采集。"""
         now = time.time()
-        if not force and now - self.last_refresh < 1.0:
+        if force:
+            self.feed.kick()
+        snapshot = self.feed.latest()
+        if snapshot is None:
+            self.error = "采集中…"  # 首帧：后台线程还在跑第一次采集
             return
         previous_id = self.selected_id
-        next_snapshot = collect_or_error()
-        if next_snapshot.get("ok"):
-            self.snapshot = next_snapshot
+        if snapshot.get("ok"):
+            self.snapshot = snapshot
             self.error = ""
             self._locate(previous_id)
         else:
-            self.error = next_snapshot.get("error", "采集失败")
+            self.error = snapshot.get("error", "采集失败")
             if not self.snapshot:
-                self.snapshot = next_snapshot
+                self.snapshot = snapshot
         self.last_refresh = now
         if now - self.version_read > 5.0:
             # 只读那份 JSON 缓存（后台线程写），所以每 5 秒扫一次足够便宜
@@ -977,7 +1026,12 @@ class Board:
             right_edge = button_x - 2
 
         if self.error:
-            message = f" 连接暂时中断 · 保留上次数据 · {self.error} "
+            # 还没有任何数据时是首帧「采集中…」，有数据才谈得上「保留上次数据」
+            message = (
+                f" 连接暂时中断 · 保留上次数据 · {self.error} "
+                if self.snapshot
+                else f" {self.error} "
+            )
             _right(self.stdscr, 4, right_edge, message, curses.color_pair(P_SELECT_BLOCKED) | curses.A_BOLD)
 
         _write(self.stdscr, 6, margin, "─" * max(0, width - margin * 2), width - margin * 2, curses.color_pair(P_BORDER))
@@ -1905,9 +1959,18 @@ def main(stdscr: curses.window) -> None:
     stdscr.nodelay(True)
     stdscr.timeout(180)
     start_version_check()  # 缓存过期时后台查一次，第一帧不等网络
-    board = Board(stdscr)
+    feed = SnapshotFeed()
+    feed.start()
+    board = Board(stdscr, feed)
     board.refresh(force=True)
     board.selected_item()
+    try:
+        run_board(stdscr, board)
+    finally:
+        feed.stop()
+
+
+def run_board(stdscr: curses.window, board: Board) -> None:
     while True:
         board.refresh()
         board.draw()
