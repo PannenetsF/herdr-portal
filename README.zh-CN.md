@@ -234,6 +234,7 @@ curl -s -X POST http://127.0.0.1:8787/api/cleanup            # 403 —— 没带
 | `HERDR_PORTAL_PORT` | 网页端口（默认 8787） |
 | `HERDR_PORTAL_HOST` | 监听地址与允许的 `Host`（默认 `127.0.0.1`，保持回环） |
 | `HERDR_PORTAL_RUNTIME` | 运行时目录（token / pid / 日志，默认 `~/.local/state/herdr-portal`） |
+| `HERDR_PORTAL_DEBUG=1` | 兜底失败时把上下文与堆栈打到 stderr（TUI 写 `$HERDR_PORTAL_RUNTIME/tui-debug.log`）；默认完全安静 |
 | `HERDR_PORTAL_NO_FRONT=1` | 点击卡片时不让终端窗口弹到前台 |
 
 服务管理：`python3 board/daemon.py start|stop|restart|status`（网页服务由插件自动拉起）。pid、token 与 `server.log` 都在 `$HERDR_PORTAL_RUNTIME`（默认 `~/.local/state/herdr-portal`）；`stop` 发现 pid 的命令行不是本插件的 `server.py` 会拒绝杀，并说明原因。

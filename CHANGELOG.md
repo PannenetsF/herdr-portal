@@ -86,3 +86,17 @@ TUI 采集搬进后台线程，守护进程不再可能误杀无关进程。条�
   正常环境下 `bash scripts/open-web.sh` 依旧复用 / 打开 Chrome 门户标签页，地址栏只剩
   `http://127.0.0.1:8787/`（token 已由前端抹掉）。注：脚本里 `daemon.py start` 挡在 osascript 之前，
   带引号的 HOST / PORT 会先让服务启动失败，因此这条改动是拆掉潜在 sink，而不是修补一个已被利用的路径。
+
+**兜底异常静默吞掉（P2-6，中）**
+
+- 问题：采集/服务/TUI 里到处是「失败也不影响看板」的兜底捕获，但既不记日志也不打印，
+  出问题时没有任何线索（哪些失败是正常的降级、哪些是真 bug 分不出来）。
+- 方案：新增 `board/logutil.py`：`HERDR_PORTAL_DEBUG=1` 时把带上下文的失败与堆栈写到 stderr
+  （TUI 因为 curses 占屏，改写到 `$HERDR_PORTAL_RUNTIME/tui-debug.log`），默认完全安静；
+  `collect()` 里两处重复捕获收敛成 `_optional()` 一个入口；`logutil.note()` 只接受 `Exception`，
+  `KeyboardInterrupt` / `SystemExit` 依旧由调用点原样抛出（全仓无 `except BaseException`）。
+  顺手把运行时目录的解析收敛到 `logutil.runtime_dir()`（daemon / server / TUI 一处定义）。
+- 验证：把 herdr 换成桩、让某个会话文件 `chmod 000` —— `HERDR_PORTAL_DEBUG=1` 时 stderr 出现
+  `[herdr-portal] 读取会话文件失败 /tmp/dbg-session/broken.jsonl` 与完整 `PermissionError` 堆栈；
+  不设该变量时 stderr 为 0 字节、退出码 0，看板数据与之前完全一致（blocked 卡片照常渲染）；
+  TUI 在 debug 模式下把同样的堆栈写进 `tui-debug.log`，屏幕上没有任何多余输出。

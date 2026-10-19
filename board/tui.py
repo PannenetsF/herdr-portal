@@ -49,6 +49,8 @@ from collect import (  # noqa: E402
     version_status,
 )
 
+import logutil  # noqa: E402 - 同目录模块（board/ 已在 sys.path 上）
+
 AGENT_COLUMNS = (
     ("blocked", "ACTION", "待确认", "等待你确认 / 输入"),
     ("working", "RUNNING", "执行中", "正在运行"),
@@ -549,7 +551,8 @@ class Board:
         try:
             focus_target(result["pane_id"])
             return True
-        except Exception:  # noqa: BLE001 - 命令已经在新标签页跑起来了
+        except Exception as exc:  # noqa: BLE001 - 命令已经在新标签页跑起来了
+            logutil.note("更新命令已起，跳转新标签页失败", exc)
             self.refresh(force=True)
             self.flash(f"已在新标签页执行 {result['hint']}", 4.0)
             return False
@@ -621,7 +624,8 @@ class Board:
         try:
             focus_target(result["pane_id"])
             return True
-        except Exception:  # noqa: BLE001 - 已经建出来了，跳转失败不算致命
+        except Exception as exc:  # noqa: BLE001 - 已经建出来了，跳转失败不算致命
+            logutil.note(f"新开 {SPAWN_LABELS[kind]} 后跳转失败", exc)
             self.refresh(force=True)
             self._locate(result["pane_id"])
             self.flash(f"已新开 {SPAWN_LABELS[kind]} {result['pane_id']}，但跳转失败", 4.0)
@@ -853,7 +857,8 @@ class Board:
             return False
         try:
             focus_target(result["pane_id"])
-        except Exception:  # noqa: BLE001 - 标签页已经起来了，跳转失败不算致命
+        except Exception as exc:  # noqa: BLE001 - 标签页已经起来了，跳转失败不算致命
+            logutil.note("mo clean 标签页跳转失败", exc)
             self.close_reclaim()
             self.refresh(force=True)
             self.flash(f"已在新标签页启动 {result['command']}", 4.0)
@@ -1953,6 +1958,18 @@ def _handle_rename_key(board: Board, key) -> None:
         board.rename_edit(key)
 
 
+def _setup_debug_log() -> None:
+    """HERDR_PORTAL_DEBUG=1 时把降级日志写进文件：curses 占着整屏，不能往 stderr 打。"""
+    if not logutil.enabled():
+        return
+    path = logutil.runtime_dir() / "tui-debug.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        logutil.set_sink(path.open("a", encoding="utf-8"))
+    except OSError:
+        pass  # 打不开日志文件就退回默认（stderr），不影响看板
+
+
 def main(stdscr: curses.window) -> None:
     _init_colors()
     _enable_mouse()
@@ -2060,5 +2077,6 @@ def run_board(stdscr: curses.window, board: Board) -> None:
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    _setup_debug_log()
     os.environ.setdefault("ESCDELAY", "25")
     curses.wrapper(main)

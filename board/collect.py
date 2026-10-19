@@ -16,7 +16,9 @@ import urllib.request
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from logutil import note  # noqa: E402 - 同目录模块（board/ 已在 sys.path 上）
 
 HERDR_BIN = os.environ.get("HERDR_BIN_PATH", "herdr")
 
@@ -461,8 +463,8 @@ def _read_session_extra(session_path: str | None) -> dict[str, Any]:
         seen_calls |= open_subagents
         extra["subagent_total"] = len(seen_calls)
         extra["subagent_running"] = len(open_subagents)
-    except OSError:
-        pass
+    except OSError as exc:
+        note(f"读取会话文件失败 {session_path}", exc)
 
     _session_cache[session_path] = (stat.st_mtime, extra)
     if len(_session_cache) > 64:  # 简单 FIFO 上限，防止会话路径累积
@@ -756,8 +758,8 @@ def _write_colors(records: dict[str, dict[str, Any]]) -> None:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
-    except OSError:
-        pass
+    except OSError as exc:
+        note(f"写颜色槽位缓存失败 {path}", exc)
 
 
 def assign_color_slots(items: list[dict[str, Any]], now: float) -> None:
@@ -853,6 +855,15 @@ def _pane_order_key(item: dict[str, Any]) -> tuple:
     )
 
 
+def _optional(context: str, func: Callable[[], Any]) -> Any:
+    """跑一个「只是增强信息」的采集：失败降级成 None，debug 模式下留痕。"""
+    try:
+        return func()
+    except Exception as exc:  # noqa: BLE001 - 增强信息失败不该拖垮看板
+        note(context, exc)
+        return None
+
+
 def collect() -> dict[str, Any]:
     now = time.time()
     payload = run_herdr("api", "snapshot")
@@ -919,16 +930,9 @@ def collect() -> dict[str, Any]:
         )
         bucket["items"].append(item)
 
-    usage = None
-    try:
-        usage = usage_summary()
-    except Exception:  # noqa: BLE001 - 用量是增强信息，失败不拖垮看板
-        usage = None
-    plan = None
-    try:
-        plan = plan_summary()
-    except Exception:  # noqa: BLE001 - 套餐余量是增强信息，失败不拖垮看板
-        plan = None
+    # 用量 / 套餐都是增强信息：失败降级成 None，但 debug 模式下留痕
+    usage = _optional("今日用量扫描失败", usage_summary)
+    plan = _optional("套餐余量读取失败", plan_summary)
     return {
         "ok": True,
         "fingerprint": _fingerprint({"items": items, "counts": counts, "focused": {
@@ -978,6 +982,7 @@ def _collect_once() -> dict[str, Any]:
     try:
         return collect()
     except Exception as exc:  # noqa: BLE001 - surface any collector failure to UI
+        note("collect() 失败", exc)
         return {
             "ok": False,
             "error": str(exc),
@@ -1121,8 +1126,8 @@ def bring_herdr_to_front() -> bool:
             timeout=6,
         )
         return True
-    except (OSError, subprocess.SubprocessError):
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        note("等待终端 App 前台化失败（改用 AppleScript 兜底）", exc)
     try:
         script = (
             "tell application \"System Events\" to set frontmost of "
@@ -1186,7 +1191,10 @@ def _load_activity() -> None:
         _activity_loaded = True
         try:
             raw = json.loads(_activity_path().read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:  # 第一次跑，正常
+            return
+        except (OSError, ValueError) as exc:
+            note(f"读取静默计时缓存失败 {_activity_path()}", exc)
             return
         if isinstance(raw, dict):
             for pane_id, record in raw.items():
@@ -1210,8 +1218,8 @@ def _save_activity(now: float) -> None:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(_activity, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, path)
-        except OSError:
-            pass
+        except OSError as exc:
+            note(f"写静默计时缓存失败 {path}", exc)
 
 
 def track_pane_activity(panes: list[dict[str, Any]], now: float) -> None:
@@ -1410,6 +1418,7 @@ def cleanup_apply(pane_ids: list[str], idle_seconds: int = DEFAULT_CLEANUP_IDLE)
             run_herdr("pane", "close", pane_id, timeout=6.0)
             closed.append(pane_id)
         except Exception as exc:  # noqa: BLE001 - 单个 pane 失败不影响其余
+            note(f"关闭 pane 失败 {pane_id}", exc)
             failed.append({"pane_id": pane_id, "error": str(exc)})
     with _MEMO_LOCK:
         for pane_id in closed:
@@ -1534,12 +1543,12 @@ def launch_task(command: list[str], label: str, cwd: str | None = None) -> dict[
     pane_id = spawned["pane_id"]
     try:
         run_herdr("pane", "run", pane_id, *command, timeout=10.0, allow_empty=True)
-    except Exception:
-        # 命令没起来就别留下一个空标签页
+    except Exception as exc:  # noqa: BLE001 - 命令没起来就别留下一个空标签页
+        note(f"在 {pane_id} 里执行命令失败", exc)
         try:
             run_herdr("pane", "close", pane_id, timeout=6.0)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as cleanup_exc:  # noqa: BLE001
+            note(f"回收空标签页失败 {pane_id}", cleanup_exc)
         raise
     return {"pane_id": pane_id, "tab_id": spawned["tab_id"], "command": " ".join(command)}
 
@@ -1616,6 +1625,7 @@ def fetch_latest_version() -> dict[str, Any]:
             raise ValueError("上游 manifest 没有 version 字段")
         record["latest"] = latest
     except Exception as exc:  # noqa: BLE001 - 查版本失败绝不该影响看板
+        note("拉取上游版本失败", exc)
         record["error"] = str(exc)
     path = _version_cache_path()
     try:
@@ -1623,8 +1633,8 @@ def fetch_latest_version() -> dict[str, Any]:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
-    except OSError:
-        pass
+    except OSError as exc:
+        note(f"写版本缓存失败 {path}", exc)
     return record
 
 
@@ -1784,8 +1794,8 @@ def _parse_usage_file(family: str, path: Path) -> dict[str, Any]:
                         acc["in"] = int(info.get("input_tokens") or 0)
                         acc["out"] = int(info.get("output_tokens") or 0)
                         acc["requests"] = max(acc["requests"], 1)
-    except OSError:
-        pass
+    except OSError as exc:
+        note(f"解析用量文件失败 {path}", exc)
     acc["model"] = model
     acc["provider"] = provider
     _file_usage_cache[str(path)] = (stat.st_mtime, stat.st_size, acc)
@@ -1912,7 +1922,8 @@ def _plan_summary() -> dict[str, Any]:
                 })
         finally:
             con.close()
-    except Exception:  # noqa: BLE001 - 套餐信息读取失败不致命
+    except Exception as exc:  # noqa: BLE001 - 套餐信息读取失败不致命
+        note(f"读取套餐库失败 {_OMP_DB}", exc)
         rows = []
     # 按 (provider, window_label) 只保留最新一条（recorded_at 最大）
     latest: dict[tuple[str, str], dict[str, Any]] = {}

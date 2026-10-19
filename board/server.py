@@ -19,6 +19,8 @@ WEB = ROOT / "web"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import logutil  # noqa: E402 - 同目录模块（board/ 已在 sys.path 上）
+
 from collect import (  # noqa: E402
     DEFAULT_CLEANUP_IDLE,
     cleanup_apply,
@@ -31,7 +33,7 @@ from collect import (  # noqa: E402
 HOST = os.environ.get("HERDR_PORTAL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HERDR_PORTAL_PORT", "8787"))
 # /api/* 的 token 与运行时目录（daemon / open-web.sh 用同一个默认值）
-RUNTIME = Path(os.environ.get("HERDR_PORTAL_RUNTIME", Path.home() / ".local/state/herdr-portal"))
+RUNTIME = logutil.runtime_dir()
 TOKEN_FILE = RUNTIME / "token"
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,}$")  # token 文件内容 / 请求头是否长得像 token
 TOKEN_LOG_RE = re.compile(r"(?i)(token=)[^&\s\"]+")  # 日志脱敏：URL 上的 token 绝不落盘
@@ -198,6 +200,7 @@ class Handler(BaseHTTPRequestHandler):
                         idle = DEFAULT_CLEANUP_IDLE
                 self._json(200, cleanup_scan(idle))
             except Exception as exc:  # noqa: BLE001
+                logutil.note("GET /api/cleanup 扫描失败", exc)
                 self._json(400, {"ok": False, "error": str(exc)})
             return
         if parsed.path.startswith("/"):
@@ -247,6 +250,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = focus_target(str(pane_id or ""))
             self._json(200, {"ok": True, "result": result})
         except Exception as exc:  # noqa: BLE001
+            logutil.note(f"{self.command} {parsed.path} 处理失败", exc)
             self._json(400, {"ok": False, "error": str(exc)})
 
     def _send_file(self, path: Path) -> None:

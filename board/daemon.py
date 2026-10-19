@@ -14,8 +14,13 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import logutil  # noqa: E402 - 运行时目录只在这里定义一次
+
 SERVER = ROOT / "server.py"
-RUNTIME = Path(os.environ.get("HERDR_PORTAL_RUNTIME", Path.home() / ".local/state/herdr-portal"))
+RUNTIME = logutil.runtime_dir()
 PID_FILE = RUNTIME / "server.pid"
 LOG_FILE = RUNTIME / "server.log"
 HOST = os.environ.get("HERDR_PORTAL_HOST", "127.0.0.1")

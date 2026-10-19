@@ -234,6 +234,7 @@ This is a local tool. `HERDR_PORTAL_HOST` exists for edge cases, but do not poin
 | `HERDR_PORTAL_PORT` | Web port (default 8787) |
 | `HERDR_PORTAL_HOST` | Bind address and allowed `Host` (default `127.0.0.1`; keep it loopback) |
 | `HERDR_PORTAL_RUNTIME` | Runtime dir for token / pid / log (default `~/.local/state/herdr-portal`) |
+| `HERDR_PORTAL_DEBUG=1` | Explain downgraded failures on stderr with stack traces (the TUI writes `$HERDR_PORTAL_RUNTIME/tui-debug.log`); silent by default |
 | `HERDR_PORTAL_NO_FRONT=1` | Do not raise the terminal window when a card is clicked |
 
 Service control: `python3 board/daemon.py start|stop|restart|status` (the plugin starts the web service on demand). Pid, token and `server.log` live in `$HERDR_PORTAL_RUNTIME` (default `~/.local/state/herdr-portal`); `stop` refuses to kill a pid whose command line is not this plugin's `server.py`.
