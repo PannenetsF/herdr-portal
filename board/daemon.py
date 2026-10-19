@@ -41,6 +41,37 @@ def process_alive(pid: int | None) -> bool:
         return False
 
 
+def process_command(pid: int) -> str | None:
+    """读进程命令行；读不到（进程没了 / ps 失败）返回 None。"""
+    try:
+        completed = subprocess.run(
+            # -ww：命令行可能很长，不加会按终端宽度截断；macOS / Linux 的 ps 都认
+            ["ps", "-ww", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def is_portal_server(pid: int) -> bool:
+    """这个 pid 现在还是本插件的 server.py 吗？
+
+    pid 会被复用：pid 文件里那个号现在可能是别的进程，直接 SIGTERM 就是误杀。
+    """
+    command = process_command(pid)
+    if not command:
+        return False
+    return "python" in command.lower() and "server.py" in command and (
+        str(ROOT) in command or "board/server.py" in command
+    )
+
+
+
 def healthy(timeout: float = 1.0) -> bool:
     """服务在不在？只问 /healthz —— 别拿 /api/snapshot 当探针：
     那会跑一次完整采集（冷启动实测数秒），守护进程会把「正在采集」误判成启动失败。"""
@@ -68,6 +99,7 @@ def start() -> int:
     env = os.environ.copy()
     env["HERDR_PORTAL_HOST"] = HOST
     env["HERDR_PORTAL_PORT"] = str(PORT)
+    env["HERDR_PORTAL_RUNTIME"] = str(RUNTIME)  # 子进程的 token / 状态目录必须和父进程一致
     log = LOG_FILE.open("ab", buffering=0)
     try:
         process = subprocess.Popen(
@@ -110,6 +142,11 @@ def stop() -> int:
         print("stopped")
         return 0
     assert pid is not None
+    if not is_portal_server(pid):
+        print(f"拒绝停止：pid {pid} 不是本插件的 server.py（pid 文件已过期或被 pid 复用占坑）", file=sys.stderr)
+        print(f"  该 pid 的实际命令行: {process_command(pid) or '(读不到)'}", file=sys.stderr)
+        print(f"  未向它发任何信号；确认后手动删除 {PID_FILE} 再重试。", file=sys.stderr)
+        return 1
     os.kill(pid, signal.SIGTERM)
     for _ in range(30):
         if not process_alive(pid):

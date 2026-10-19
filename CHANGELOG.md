@@ -59,3 +59,18 @@ TUI 采集搬进后台线程，守护进程不再可能误杀无关进程。条�
   叫醒采集线程立刻补采一次，按键处理不再依赖采集完成。
 - 验证：把 herdr 换成 `sleep 3` 的桩（`HERDR_BIN_PATH`），首帧数据到位后连按 12 次方向键：
   旧版最差 4.90s 才有反应、按 `q` 要 4.54s 才退出；新版最差 0.13s、`q` 0.22s 退出（两者中位数均 0.03s）。
+
+**daemon 停服务可能误杀无关进程（P1-4，中）**
+
+- 问题：`board/daemon.py` 的 `stop` 直接对 pid 文件里的号发 `SIGTERM` → `SIGKILL`，不校验这个 pid
+  现在还是不是本插件的 `server.py`：pid 复用（或 pid 文件过期）时会误杀无关进程；另外启动子进程时
+  没有显式传 `HERDR_PORTAL_RUNTIME`，父子进程的 token / 日志目录只靠环境变量恰好一致。
+- 方案：新增 `process_command()` / `is_portal_server()`——动手前用 `ps -ww -o command= -p <pid>`
+  取命令行，必须同时命中 `python` 与 `board/server.py` 才继续；否则打印该 pid 的真实命令行、
+  明确拒绝停止（返回 1）且不发任何信号。子进程 env 显式带上 `HERDR_PORTAL_RUNTIME`（连同 HOST / PORT）。
+- 验证：把 pid 文件指向 `sleep 1000` 的进程 → `daemon.py stop` 退出码 1，stderr 打印
+  「拒绝停止：pid … 不是本插件的 server.py」+「该 pid 的实际命令行: sleep 1000」，sleep 进程存活；
+  pid 文件指回真正的 `server.py` 时同一套校验判定通过。另跑
+  `HERDR_PORTAL_RUNTIME=/tmp/portal-rt-test2 HERDR_PORTAL_PORT=8791 daemon.py start`：
+  `server.log` / `server.pid` / `token`(0600) 全部落在该目录、`/healthz` 正常应答、`stop` 干净退出，
+  默认运行时目录不受影响。
