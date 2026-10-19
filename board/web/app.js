@@ -107,6 +107,7 @@ function card(item) {
       : "";
   return `
     <article class="card tone-${esc(tone)} ${item.focused ? "focused" : ""} ${selected ? "selected" : ""}"${slotAttrs}
+      data-pane="${esc(item.pane_id)}"
       data-active="${item.activity_active ? "true" : "false"}"
       tabindex="0"
       aria-label="${esc(strongTitle + " · " + item.agent_label + " · " + item.status_label)}"
