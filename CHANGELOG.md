@@ -74,3 +74,15 @@ TUI 采集搬进后台线程，守护进程不再可能误杀无关进程。条�
   `HERDR_PORTAL_RUNTIME=/tmp/portal-rt-test2 HERDR_PORTAL_PORT=8791 daemon.py start`：
   `server.log` / `server.pid` / `token`(0600) 全部落在该目录、`/healthz` 正常应答、`stop` 干净退出，
   默认运行时目录不受影响。
+
+**open-web.sh 的 AppleScript 注入面（P2-5，低-中）**
+
+- 问题：脚本把 `HERDR_PORTAL_HOST` / `HERDR_PORTAL_PORT` 派生的 URL 直接拼进
+  `osascript -e "…"` 的源码里；形如 `http://127.0.0.1:8787/" & (do shell script "touch /tmp/x") & "`
+  的取值会被 AppleScript 当成表达式执行（实测这段 payload 确实触发了 `do shell script`）。
+- 方案：改成 `osascript -e 'on run argv' … -e 'end run' -- "$url" "$open_url"`，
+  两个 URL 通过 argv 传入，AppleScript 源码里不再出现任何外部字符串。
+- 验证：同一段 payload 分别喂给两种写法——旧写法执行了 `touch /tmp/pwned_a`，新写法没有任何执行；
+  正常环境下 `bash scripts/open-web.sh` 依旧复用 / 打开 Chrome 门户标签页，地址栏只剩
+  `http://127.0.0.1:8787/`（token 已由前端抹掉）。注：脚本里 `daemon.py start` 挡在 osascript 之前，
+  带引号的 HOST / PORT 会先让服务启动失败，因此这条改动是拆掉潜在 sink，而不是修补一个已被利用的路径。
