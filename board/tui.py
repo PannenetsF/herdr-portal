@@ -26,6 +26,8 @@ if str(ROOT) not in sys.path:
 from collect import (  # noqa: E402
     CLEANUP_THRESHOLD_LABELS,
     CLEANUP_THRESHOLDS,
+    COLOR_SLOTS,
+    COLOR_SLOT_COUNT,
     DEFAULT_CLEANUP_IDLE,
     RENAME_KINDS,
     RENAME_LABELS,
@@ -51,8 +53,31 @@ AGENT_COLUMNS = (
     ("settled", "SETTLED", "已就绪", "空闲 / 完成"),
 )
 
-HELP_AGENTS = "↑↓ 选择  ←→ 切列  Enter 跳转  N 新 Tab  s/S 新 Pane 右/下  E 重命名  X 释放闲置  U 更新  Q 退出"
-HELP_WINDOWS = "↑↓←→ 选择  Enter 跳转  N 新 Tab  s/S 新 Pane 右/下  E 重命名  X 释放闲置  U 更新  Tab 返回  Q 退出"
+# 底部快捷键提示按重要性排序，宽度不够时从尾部丢弃；PgUp/PgDn 与 C 由上下文面板边框自述
+HINT_AGENTS = (
+    "↑↓ 选择",
+    "←→ 切列",
+    "Enter 跳转",
+    "N 新 Tab",
+    "s/S 新 Pane",
+    "E 重命名",
+    "X 释放闲置",
+    "M 用量",
+    "U 更新",
+    "Q 退出",
+)
+HINT_WINDOWS = (
+    "↑↓←→ 选择",
+    "Enter 跳转",
+    "N 新 Tab",
+    "s/S 新 Pane",
+    "E 重命名",
+    "X 释放闲置",
+    "M 用量",
+    "U 更新",
+    "Tab 返回",
+    "Q 退出",
+)
 HELP_RECLAIM = "↑↓ 移动  Space 选中  A 全选  N 清空  T 阈值  d/D 磁盘预览·清理  Enter 释放  Esc 返回"
 HELP_RENAME = "输入新名称  Tab 切换对象  ←→ 移动光标  Ctrl+U 清空  Enter 保存  Esc 取消"
 CARD_HEIGHT = 5
@@ -81,6 +106,7 @@ P_CARD_WINDOW = 19
 P_DETAIL = 20
 P_LIVE = 21
 P_SELECT_ACCENT = 22
+P_SLOT_BASE = 30  # P_SLOT_BASE + slot → 会话标签色对（前景=槽位色，背景=卡片底）
 
 COLUMN_PAIR = {
     "blocked": P_BLOCKED,
@@ -111,6 +137,59 @@ def _plain(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _plain_line(line: str) -> str:
+    """单行纯文本：去 ANSI / Markdown 标记，保留缩进（最多 6 格），去掉行尾空白。"""
+    line = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line).replace("\t", "    ")
+    indent = line[: len(line) - len(line.lstrip(" "))]
+    body = re.sub(r"(\*\*|__|`|~~)", "", line[len(indent) :])
+    body = re.sub(r"^(?:#{1,6}|[-*+>]|\d+[.)])\s+", "", body)
+    return (indent[:6] + body.rstrip()).rstrip()
+
+
+def _chunk(text: str, width: int) -> tuple[str, str]:
+    """按显示宽度切出第一段，返回 (段, 余下)；尽量在空格处断行。"""
+    used = 0
+    cut = 0
+    for index, char in enumerate(text):
+        char_width = _char_width(char)
+        if used + char_width > width:
+            break
+        used += char_width
+        cut = index + 1
+    else:
+        return text, ""
+    if cut <= 0:
+        return "", text
+    space = text.rfind(" ", 0, cut + 1)
+    if space >= max(1, cut // 2):
+        return text[:space], text[space + 1 :]
+    return text[:cut], text[cut:]
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """按显示宽度折行：保留原始缩进，丢掉空行（尾部输出里空行只占地方），每行不超过 width。"""
+    if width < 2:
+        return []
+    lines: list[str] = []
+    for raw in str(text or "").replace("\r", "").split("\n"):
+        line = _plain_line(raw)
+        if not line:
+            continue
+        indent = line[: len(line) - len(line.lstrip(" "))]
+        rest = line
+        first = True
+        while rest:
+            room = width if first else max(6, width - _width(indent))
+            piece, rest = _chunk(rest, room)
+            if not piece:
+                break
+            if not first and indent:
+                piece = indent + piece
+            lines.append(piece.rstrip())
+            first = False
+    return lines
+
+
 def _char_width(char: str) -> int:
     if not char or unicodedata.combining(char):
         return 0
@@ -119,6 +198,64 @@ def _char_width(char: str) -> int:
 
 def _width(text: str) -> int:
     return sum(_char_width(char) for char in text)
+
+
+def _fmt_tokens(value) -> str:
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def _fmt_cost(value) -> str:
+    try:
+        n = float(value or 0)
+    except (TypeError, ValueError):
+        return "$0"
+    if n >= 100:
+        return f"${n:.1f}"
+    if n >= 1:
+        return f"${n:.2f}"
+    if n >= 0.01:
+        return f"${n:.3f}"
+    return f"${n:.4f}" if n > 0 else "$0"
+
+
+def _usage_bar(fraction: float) -> str:
+    """百分比条：███░░ 表示已用比例，数字附注百分比。"""
+    try:
+        frac = max(0.0, min(1.0, float(fraction or 0)))
+    except (TypeError, ValueError):
+        frac = 0.0
+    filled = round(frac * 6)
+    bar = "██" * filled + "░░" * (6 - filled)
+    return f"{bar} {frac * 100:3.0f}%"
+
+
+def _ago(label: str | None) -> str:
+    """把 human_age 的输出变成「多久前」：刚刚 / 12s 前 / 2h 前。"""
+    text = str(label or "").strip()
+    if not text:
+        return ""
+    return text if text == "刚刚" else f"{text} 前"
+
+
+def _hint_line(segments: tuple[str, ...], room: int) -> str:
+    """按重要性贪心拼接快捷键提示：放不下的一段直接丢弃，绝不与右侧标签重叠。"""
+    out: list[str] = []
+    used = 0
+    for segment in segments:
+        cost = _width(segment) + (3 if out else 0)
+        if used + cost > room:
+            break
+        out.append(segment)
+        used += cost
+    return " · ".join(out)
 
 
 def _fit(text: str, width: int, pad: bool = False) -> str:
@@ -232,6 +369,16 @@ class Board:
         self.reclaim: dict | None = None
         # 重命名面板：None 表示未打开
         self.rename: dict | None = None
+        # 用量面板：None 表示未打开
+        self.usage: dict | None = None
+        # 实时上下文面板：滚动位置 / 是否聚焦放大 / 是否跟随最新输出
+        self.context_focus = False
+        self.detail_scroll = 0
+        self.detail_follow = True
+        self.detail_lines_total = 0
+        self.detail_lines_visible = 0
+        self.detail_max_start = 0
+        self.detail_sig: tuple | None = None
         self.last_click = (0.0, -1, -1)
         # 版本检查：只读缓存，后台线程负责刷新
         self.version = version_status()
@@ -713,6 +860,17 @@ class Board:
         if button == "reclaim":
             self.open_reclaim()
             return False
+        if button == "usage":
+            self.usage = {
+                "usage": (self.snapshot.get("usage") or {}) or {},
+                "plan": (self.snapshot.get("plan") or {}) or {},
+            }
+            self.flash("模型用量 · 今日")
+            return False
+        if self.usage is not None:
+            if button == "usage-close":
+                self.usage = None
+            return False
         if self.reclaim is not None:
             if button == "reclaim-apply":
                 self.reclaim_confirm()
@@ -732,6 +890,14 @@ class Board:
                 row = self._row_at(my, mx)
                 if row is not None:
                     self.reclaim_toggle(row)
+            return False
+        if button == "context-page":
+            # 点一下翻一页；已经到底就回到顶部
+            if self.detail_scroll >= max(0, self.detail_max_start):
+                self.detail_scroll = 0
+                self.detail_follow = False
+            else:
+                self.page_context(1)
             return False
         target = self._card_at(my, mx)
         if target is None:
@@ -773,6 +939,7 @@ class Board:
         stats = (
             ("blocked", counts.get("blocked", 0), "待确认"),
             ("working", counts.get("working", 0), "执行中"),
+            ("working", counts.get("background", 0), "后台"),
             ("settled", counts.get("idle", 0), "空闲"),
             ("window", counts.get("done", 0), "完成"),
             ("window", counts.get("windows", 0), "窗口"),
@@ -781,28 +948,32 @@ class Board:
         if width >= 78:
             for key, value, label in stats:
                 pill = f" {int(value):02d}  {label} "
-                _write(self.stdscr, 4, x, pill, attr=curses.color_pair(SELECT_PAIR[key]) | curses.A_BOLD)
+                _write(self.stdscr, 3, x, pill, attr=curses.color_pair(SELECT_PAIR[key]) | curses.A_BOLD)
                 x += _width(pill) + 2
         else:
             summary = "  ".join(f"{label} {value}" for _, value, label in stats)
-            _write(self.stdscr, 4, margin, summary, width - margin * 2, curses.color_pair(P_MUTED))
+            _write(self.stdscr, 3, margin, summary, width - margin * 2, curses.color_pair(P_MUTED))
 
-        # 行4 右侧：常驻动作按钮（鼠标可点，标签末尾是等效快捷键）
-        buttons: list[tuple[str, str, int]] = [
-            (" ⌫  释放闲置  X ", "reclaim", P_SELECT_ACCENT),
-            (" ✎  重命名  E ", "rename", P_SELECT_ACCENT),
-            (" ⬓  新 Pane  S ", "spawn-pane", P_SELECT_ACCENT),
-            (" ＋  新 Tab  N ", "spawn-tab", P_SELECT_ACCENT),
+        # 行4：动作按钮单独一行（鼠标可点，标签末尾是等效快捷键）；挤不下时整排退化成图标+快捷键
+        buttons: list[tuple[str, str, str, int]] = [
+            (" ⌫  释放闲置  X ", " ⌫X ", "reclaim", P_SELECT_ACCENT),
+            (" ✎  重命名  E ", " ✎E ", "rename", P_SELECT_ACCENT),
+            (" ◑  用量  M ", " ◑M ", "usage", P_SELECT_ACCENT),
+            (" ⬓  新 Pane  S ", " ⬓S ", "spawn-pane", P_SELECT_ACCENT),
+            (" ＋  新 Tab  N ", " ＋N ", "spawn-tab", P_SELECT_ACCENT),
         ]
         if self.version.get("state") == "outdated":
             # 有新版时最右边多一颗醒目的更新按钮，其余按钮整体左移
-            buttons.insert(0, (f" ⬆  更新 v{self.version['latest']}  U ", "update", P_SELECT_WORKING))
-        for label, name, pair in buttons:
-            button_x = right_edge - _width(label)
-            if button_x <= x + 2:
+            buttons.insert(0, (f" ⬆  更新 v{self.version['latest']}  U ", " ⬆U ", "update", P_SELECT_WORKING))
+        # 一整排放得下就用长标签，否则整排退化成图标+快捷键（不整排混用，避免长短参差）
+        long_mode = sum(_width(label) for label, _c, _n, _p in buttons) + 2 * (len(buttons) - 1) <= right_edge - margin - 2
+        for label, compact, name, pair in buttons:
+            text = label if long_mode else compact
+            if _width(text) + 2 > right_edge - margin - 2:
                 break
-            _write(self.stdscr, 4, button_x, label, attr=curses.color_pair(pair) | curses.A_BOLD)
-            self.hit_buttons.append((4, 4, button_x, button_x + _width(label) - 1, name))
+            button_x = right_edge - _width(text)
+            _write(self.stdscr, 4, button_x, text, attr=curses.color_pair(pair) | curses.A_BOLD)
+            self.hit_buttons.append((4, 4, button_x, button_x + _width(text) - 1, name))
             right_edge = button_x - 2
 
         if self.error:
@@ -889,7 +1060,16 @@ class Board:
 
     def draw_card(self, item: dict, y: int, x: int, height: int, width: int, selected: bool) -> None:
         key = _column_key(item)
-        base_pair = SELECT_PAIR[key] if selected else P_CARD
+        if selected:
+            base_pair = SELECT_PAIR[key]
+        else:
+            # 会话标签色：边框 + 标题用该会话专属颜色，状态仍由 ○/▸ 行的状态色表达
+            slot = item.get("color_slot")
+            base_pair = (
+                P_SLOT_BASE + slot
+                if isinstance(slot, int) and 0 <= slot < COLOR_SLOT_COUNT
+                else P_CARD
+            )
         base_attr = curses.color_pair(base_pair)
         status_attr = curses.color_pair(SELECT_PAIR[key] if selected else CARD_STATUS_PAIR[key]) | curses.A_BOLD
         muted_attr = curses.color_pair(base_pair if selected else P_CARD_MUTED)
@@ -904,13 +1084,31 @@ class Board:
             _write(self.stdscr, row, x + width - 1, vt, 1, base_attr)
         _write(self.stdscr, y + height - 1, x, bl + hz * (width - 2) + br, width, base_attr)
 
-        # 顶边角标：驱动框架（OMP / PI / …）弱化成边框上的小写标签
+        # 顶边角标：驱动框架 + 供应商 + 主模型 + Sub Agent 数（弱化成边框上的小写标签）
         badge = str(item.get("agent_label") or item.get("agent") or "").strip().lower()
+        model = str(item.get("model") or "").strip()
+        provider = str(item.get("provider") or "").strip()
+        sub_running = int(item.get("subagent_running") or 0)
+        sub_total = int(item.get("subagent_total") or 0)
+        parts = [badge]
+        if model:
+            # 供应商用小前缀标注：OpenCode→oc，DeepSeek→ds，Anthropic→an
+            prov_abbr = {"OpenCode": "oc", "DeepSeek": "ds", "Anthropic": "an", "OpenAI": "oi"}.get(provider, "")
+            if prov_abbr:
+                parts.append(f"{prov_abbr}:{model.lower()}")
+            else:
+                parts.append(model.lower())
+        if sub_total:
+            sub_text = f"⧉ {sub_running}▸" if sub_running else f"⧉{sub_total}"
+            parts.append(sub_text)
         if badge and width >= 24:
-            tag = f" {_fit(badge, max(4, width // 3))} "
+            tag = f" {_fit('·'.join(parts), max(4, width // 3))} "
             tag_x = x + width - 2 - _width(tag)
             if tag_x > x + 4:
-                _write(self.stdscr, y, tag_x, tag, attr=muted_attr | (0 if selected else curses.A_DIM))
+                attr = muted_attr | (0 if selected else curses.A_DIM)
+                if sub_running:
+                    attr |= curses.A_BOLD
+                _write(self.stdscr, y, tag_x, tag, attr=attr)
 
         # 行1：标题（卡片主角）+ 右侧工作区
         marker = "◆" if selected else ("●" if item.get("focused") else "○")
@@ -935,9 +1133,9 @@ class Board:
         line2 = f"▸ {phase} · {_plain(activity_title)}" if activity_title else f"▸ {phase}"
         _write(self.stdscr, y + 2, x + 2, line2, width - 4, status_attr)
 
-        # 行3：状态 / 工具 + pane
+        # 行3：状态 / 最后活动多久前 + pane
         status = item.get("status_label") or ""
-        age = item.get("last_active_label") or item.get("quiet_label") or ""
+        age = _ago(item.get("last_active_label") or item.get("quiet_label") or "")
         tool = item.get("activity_tool") or (item.get("family") or "")
         state_text = f"{status}{f' · {age}' if age else ''} · {tool.upper()}"
         _write(self.stdscr, y + 3, x + 2, state_text, width - 4, muted_attr)
@@ -1156,67 +1354,366 @@ class Board:
             _write(self.stdscr, button_y, apply_x, apply_label, attr=apply_attr)
             self.hit_buttons.append((button_y, button_y, apply_x, apply_x + _width(apply_label) - 1, "reclaim-apply"))
 
+    def context_body_width(self, width: int) -> int:
+        """上下文面板正文宽度：外框 4 格 + 前缀 2 格 + 缩进 2 格。"""
+        return max(8, width - 10)
+
+    def detail_height(self, height: int, item: dict | None = None, width: int = 0) -> int:
+        """实时上下文面板高度：内容多高就多高，但默认不挤掉第 3 张卡片，C 聚焦时让给上下文。"""
+        if height < 32:
+            return 0
+        if self.context_focus:
+            return max(6, min(height - 20, round(height * 0.55)))
+        room = max(6, min(14, height - 33))
+        if item is None or width <= 0:
+            return room
+        lines = len(self.context_lines(item, self.context_body_width(width)))
+        return max(6, min(room, 4 + lines))
+
+    def toggle_context(self) -> None:
+        """C：上下文聚焦——面板放大到半屏以上，卡片列只留当前列。"""
+        self.context_focus = not self.context_focus
+        self.detail_follow = True
+
+    def page_context(self, direction: int) -> None:
+        """上下文面板翻页：到底/到顶后停住，到底即恢复「跟随最新输出」。"""
+        step = max(1, self.detail_lines_visible)
+        limit = max(0, self.detail_max_start)
+        target = max(0, min(limit, self.detail_scroll + direction * step))
+        self.detail_scroll = target
+        self.detail_follow = target >= limit
+
+    def context_lines(self, item: dict, width: int) -> list[str]:
+        """选中项的实时上下文：最近一次输出（多行、折行），退化到 preview / 终端标题。"""
+        text = str(item.get("last_output") or "").strip()
+        if not text:
+            text = str(item.get("preview") or item.get("terminal_title") or "").strip()
+        return _wrap(text, width) if text else []
+
     def draw_detail(self, y: int, width: int, height: int) -> None:
         if height < 6:
             return
         margin = 2
         panel_width = width - margin * 2
+        inner = panel_width - 4
+        body_width = self.context_body_width(width)
         item = self.selected_item()
-        _box(self.stdscr, y, margin, height, panel_width, curses.color_pair(P_BORDER))
-        _write(self.stdscr, y, margin + 2, " SELECTED / 当前选中 ", attr=curses.color_pair(P_ACCENT) | curses.A_BOLD)
+        key = _column_key(item) if item else "window"
+        pair = COLUMN_PAIR[key]
+        border_attr = curses.color_pair(pair)
+        _box(self.stdscr, y, margin, height, panel_width, border_attr)
+        _write(self.stdscr, y, margin + 2, " 实时上下文 / CONTEXT ", attr=border_attr | curses.A_BOLD)
+
+        self.detail_lines_total = 0
+        self.detail_lines_visible = 0
+        self.detail_max_start = 0
         if not item:
-            _write(self.stdscr, y + 2, margin + 2, "当前没有项目", panel_width - 4, curses.color_pair(P_MUTED))
+            _write(self.stdscr, y + 2, margin + 2, "当前没有项目", inner, curses.color_pair(P_MUTED))
             return
 
-        key = _column_key(item)
         status = item.get("status_label") or ""
         badge = str(item.get("agent_label") or "").strip().lower()
-        tag = f"{badge}  ·  " if badge else ""
+        model = str(item.get("model") or "").strip().lower()
+        provider = str(item.get("provider") or "").strip()
+        sub_total = int(item.get("subagent_total") or 0)
+        sub_running = int(item.get("subagent_running") or 0)
+        tag_bits = [badge]
+        if model:
+            tag_bits.append(f"{provider}/{model}" if provider else model)
+        if sub_total:
+            tag_bits.append(f"⧉{sub_total}" + (f" · {sub_running} 运行中" if sub_running else ""))
+        tag = f"{'  ·  '.join(b for b in tag_bits if b)}  ·  " if any(tag_bits) else ""
         status_x = margin + panel_width - 2 - _width(status)
-        _write(self.stdscr, y + 1, status_x, status, attr=curses.color_pair(COLUMN_PAIR[key]) | curses.A_BOLD)
+        _write(self.stdscr, y + 1, status_x, status, attr=border_attr | curses.A_BOLD)
         if tag:
             _write(self.stdscr, y + 1, status_x - _width(tag), tag, attr=curses.color_pair(P_MUTED))
         title_room = max(0, status_x - _width(tag) - margin - 4)
+        marker = "●" if item.get("focused") else "◆"
         _write(
             self.stdscr,
             y + 1,
             margin + 2,
-            item.get("title") or "",
+            f"{marker} {item.get('title') or item.get('pane_id') or 'Untitled'}",
             title_room,
             curses.color_pair(P_TEXT) | curses.A_BOLD,
         )
 
+        # 行2：进展阶段 + 执行标题（左），工具与实时度（右）
         phase = item.get("activity_phase") or "当前进展"
         activity = item.get("activity_title") or ""
         progress = f"▸ {phase}{f' · {_plain(activity)}' if activity else ''}"
-        _write(self.stdscr, y + 2, margin + 2, progress, panel_width - 4, curses.color_pair(COLUMN_PAIR[key]) | curses.A_BOLD)
+        tool = str(item.get("activity_tool") or "").upper()
+        fresh = _ago(item.get("last_output_label") or "") if str(item.get("last_output") or "").strip() else ""
+        right_bits = [bit for bit in (tool, f"↻ {fresh}" if fresh else "") if bit]
+        right = "  ·  ".join(right_bits)
+        right_room = 0 if not right else min(_width(right) + 4, max(0, inner // 2))
+        if right and right_room:
+            _write(self.stdscr, y + 2, margin + panel_width - 2 - _width(right), right, attr=curses.color_pair(P_MUTED))
+        _write(
+            self.stdscr,
+            y + 2,
+            margin + 2,
+            progress,
+            max(0, inner - right_room),
+            border_attr | curses.A_BOLD,
+        )
 
+        # 行3 起：最近输出（多行折行 + PgUp/PgDn 滚动）
+        lines = self.context_lines(item, body_width)
+        body_rows = max(0, height - 4)
+        signature = (item.get("pane_id"), len(lines), lines[-1] if lines else "")
+        if signature != self.detail_sig:
+            # 选中项或输出变了：回到最新一行，除非用户正停在没有新内容的中段
+            if self.detail_sig is None or self.detail_sig[0] != signature[0] or self.detail_follow:
+                self.detail_follow = True
+            self.detail_sig = signature
+        total = len(lines)
+        max_start = max(0, total - body_rows)
+        if self.detail_follow:
+            self.detail_scroll = max_start
+        self.detail_scroll = max(0, min(self.detail_scroll, max_start))
+        start = self.detail_scroll
+        self.detail_lines_total = total
+        self.detail_lines_visible = min(body_rows, total)
+        self.detail_max_start = max_start
+
+        if not lines:
+            _write(self.stdscr, y + 3, margin + 2, "↳ 暂无最近输出", inner, curses.color_pair(P_MUTED))
+        else:
+            for offset in range(self.detail_lines_visible):
+                row = y + 3 + offset
+                text = lines[start + offset]
+                prefix = "↳ " if start + offset == 0 else "  "
+                _write(self.stdscr, row, margin + 2, prefix + text, inner, curses.color_pair(P_TEXT))
+
+        # 面包屑挪到底边框右侧，省下一行给输出
         location = "  ›  ".join(
             part for part in (item.get("workspace"), item.get("tab"), item.get("pane_id")) if part
         )
         quiet = item.get("quiet_label") or ""
         if quiet:
             location = f"{location}  ›  静默 {quiet}"
-        _write(self.stdscr, y + 3, margin + 2, location, panel_width - 4, curses.color_pair(P_MUTED))
-        output = item.get("last_output") or item.get("terminal_title") or "暂无最近输出"
-        preview = _fit(f"↳ {_plain(output)}", panel_width - 4)
-        _write(self.stdscr, y + 4, margin + 2, preview, panel_width - 4, curses.color_pair(P_CARD_MUTED))
+        crumb = f" {_fit(location, max(0, panel_width - _width(' 实时上下文 / CONTEXT ') - 8))} "
+        if _width(crumb) + 6 < panel_width:
+            _write(self.stdscr, y + height - 1, margin + 2, crumb, attr=curses.color_pair(P_MUTED))
+
+        # 顶边框右侧：翻页/聚焦提示，整块可点（下翻，到底回到顶部）
+        if total:
+            if max_start:
+                hint = f" {start + 1}-{start + self.detail_lines_visible} / {total} 行 · PgUp·PgDn "
+            else:
+                hint = f" 全部 {total} 行 "
+            focus_hint = "· C 收起 " if self.context_focus else "· C 聚焦 "
+            if _width(hint) + _width(focus_hint) + _width(" 实时上下文 / CONTEXT ") + 6 <= panel_width:
+                hint += focus_hint
+            hint_x = margin + panel_width - 2 - _width(hint)
+            if hint_x > margin + _width(" 实时上下文 / CONTEXT ") + 4:
+                _write(self.stdscr, y, hint_x, hint, attr=curses.color_pair(P_MUTED))
+                # 有叠加面板时不登记点击区，免得抢掉弹层的按钮
+                if self.reclaim is None and self.rename is None and self.usage is None:
+                    self.hit_buttons.append(
+                        (y + 1, y + height - 2, margin + 1, margin + panel_width - 2, "context-page")
+                    )
+
+
+    def draw_usage(self, height: int, width: int) -> None:
+        """模型用量面板：今日各模型的 token/成本 + 各供应商套餐余量，叠加显示，Esc 关闭。"""
+        state = self.usage
+        if state is None:
+            return
+        usage = state.get("usage") or {}
+        plan = state.get("plan") or {}
+        models = usage.get("models") or []
+        total = usage.get("total") or {}
+        providers = plan.get("providers") or []
+
+        box_width = max(64, min(112, width - 6))
+        # 动态高度：模型表 + 套餐表
+        plan_rows = sum(len(p.get("windows") or []) for p in providers)
+        rows_needed = 6 + len(models) + ((3 + plan_rows) if providers else 1)
+        box_height = max(12, min(height - 4, rows_needed))
+        x = max(1, (width - box_width) // 2)
+        y = max(1, (height - box_height) // 2)
+        # 内容区底部（note 行之上）作为裁剪阈值
+        content_clip = y + box_height - 3
+        base = curses.color_pair(P_CARD)
+        muted = curses.color_pair(P_CARD_MUTED)
+        accent = curses.color_pair(P_ACCENT) | curses.A_BOLD
+        value = curses.color_pair(P_SELECT_ACCENT) | curses.A_BOLD
+
+        for row in range(y, y + box_height):
+            _write(self.stdscr, row, x, "", box_width, base, pad=True)
+        _box(self.stdscr, y, x, box_height, box_width, accent, heavy=True)
+        _write(self.stdscr, y, x + 2, " MODEL USAGE  /  今日用量 ", attr=accent)
+
+        since = usage.get("since") or ""
+        sessions = usage.get("sessions") or 0
+        summary = f" {since}  ·  {sessions} 个会话   "
+        _write(self.stdscr, y + 1, x + 2, summary, box_width - 8, base | curses.A_BOLD)
+
+
+        def put_cell(cy: int, cx: int, text, cw: int, attr: int, align: str = "l") -> None:
+            """按显示宽度写一个单元格：CJK 宽字符不再把后面的列挤歪。"""
+            text = _fit(str(text), cw)
+            gap = cw - _width(text)
+            if gap > 0:
+                text = (" " * gap + text) if align == "r" else (text + " " * gap)
+            _write(self.stdscr, cy, cx, text, cw, attr)
+
+        def col_w(values: list[str], floor: int) -> int:
+            return max([floor] + [_width(v) for v in values])
+
+        # 汇总行：输入 / 输出 / 请求 / 成本
+        row_y = y + 2
+        cells = (
+            ("tokens 输入", _fmt_tokens(total.get("tokens_in"))),
+            ("tokens 输出", _fmt_tokens(total.get("tokens_out"))),
+            ("请求数", _fmt_tokens(total.get("requests"))),
+            ("成本", _fmt_cost(total.get("cost"))),
+        )
+        cell_w = (box_width - 4) // 4
+        for i, (label, val_text) in enumerate(cells):
+            cx = x + 2 + i * cell_w
+            _write(self.stdscr, row_y, cx, label, cell_w - 2, muted | curses.A_DIM)
+            _write(self.stdscr, row_y + 1, cx, val_text, cell_w, value)
+
+        # ---- 模型用量表：列宽按数据自适应，逐格上色 ----
+        list_top = y + 4
+        cursor_row = list_top
+        table_w = box_width - 4
+        if models:
+            provs = [str(m.get("provider") or "—") for m in models]
+            names = [str(m.get("model") or "—") for m in models]
+            ins = [_fmt_tokens(m.get("tokens_in")) for m in models]
+            outs = [_fmt_tokens(m.get("tokens_out")) for m in models]
+            reqs = [str(m.get("requests") or 0) for m in models]
+            costs = [_fmt_cost(m.get("cost")) for m in models]
+            c_prov = col_w(provs, 10) + 2
+            c_model = min(col_w(names, 14) + 2, 36)
+            c_in = col_w(ins + ["输入"], 8) + 1
+            c_out = col_w(outs + ["输出"], 8) + 1
+            c_req = col_w(reqs + ["请求"], 6) + 1
+            c_cost = col_w(costs + ["成本"], 8) + 1
+            hx = x + 2
+            for head, cw, al in (
+                ("供应商", c_prov, "l"), ("模型", c_model, "l"), ("输入", c_in, "r"),
+                ("输出", c_out, "r"), ("请求", c_req, "r"), ("成本", c_cost, "r"),
+            ):
+                put_cell(cursor_row, hx, head, cw, muted | curses.A_BOLD, al)
+                hx += cw
+            cursor_row += 1
+            for m, prov, name, tin, tout, req, cost_txt in zip(models, provs, names, ins, outs, reqs, costs):
+                if cursor_row >= content_clip:
+                    break
+                try:
+                    spent = float(m.get("cost") or 0)
+                except (TypeError, ValueError):
+                    spent = 0.0
+                # 成本高亮：≥$25 红 · ≥$1 黄 · 有花费正常 · $0 弱化
+                if spent >= 25:
+                    cost_attr = curses.color_pair(P_CARD_BLOCKED) | curses.A_BOLD
+                elif spent >= 1:
+                    cost_attr = curses.color_pair(P_CARD_WORKING)
+                elif spent > 0:
+                    cost_attr = base
+                else:
+                    cost_attr = muted | curses.A_DIM
+                hx = x + 2
+                put_cell(cursor_row, hx, prov, c_prov, muted)
+                hx += c_prov
+                put_cell(cursor_row, hx, name, c_model, base | curses.A_BOLD)
+                hx += c_model
+                put_cell(cursor_row, hx, tin, c_in, base, "r")
+                hx += c_in
+                put_cell(cursor_row, hx, tout, c_out, base, "r")
+                hx += c_out
+                put_cell(cursor_row, hx, req, c_req, base, "r")
+                hx += c_req
+                put_cell(cursor_row, hx, cost_txt, c_cost, cost_attr, "r")
+                cursor_row += 1
+        else:
+            _write(self.stdscr, cursor_row, x + 2, "今日暂无用量数据", table_w, muted | curses.A_DIM)
+            cursor_row += 1
+
+        # ---- 套餐余量表：固定列位 + 按负荷配色的进度条 ----
+        cursor_row += 1
+        if providers:
+            _write(self.stdscr, cursor_row, x + 2, "套餐余量（各供应商窗口用度）", table_w, accent)
+            cursor_row += 1
+            flat = []
+            for provider in providers:
+                pname = str(provider.get("provider") or "—")
+                for win in provider.get("windows") or []:
+                    flat.append((pname, win))
+            c_prov2 = col_w([p for p, _ in flat] + ["供应商"], 12) + 2
+            c_win = min(col_w([str(w.get("window_label") or "—") for _, w in flat] + ["窗口"], 8) + 2, 20)
+            bar_w = 14
+            c_status = 10
+            px = x + 2
+            wx = px + c_prov2
+            bx = wx + c_win
+            sx = bx + bar_w + 9
+            put_cell(cursor_row, px, "供应商", c_prov2, muted | curses.A_BOLD)
+            put_cell(cursor_row, wx, "窗口", c_win, muted | curses.A_BOLD)
+            put_cell(cursor_row, bx, "已用", bar_w + 6, muted | curses.A_BOLD)
+            put_cell(cursor_row, sx, "状态", c_status, muted | curses.A_BOLD)
+            cursor_row += 1
+            status_map = {"ok": ("正常", curses.color_pair(P_CARD_SETTLED)), "warning": ("接近上限", curses.color_pair(P_CARD_WORKING) | curses.A_BOLD), "exhausted": ("已耗尽", curses.color_pair(P_CARD_BLOCKED) | curses.A_BOLD)}
+            for pname, win in flat:
+                if cursor_row >= content_clip:
+                    break
+                frac = max(0.0, min(1.0, float(win.get("used_fraction") or 0)))
+                full = int(round(frac * bar_w))
+                if frac >= 0.8:
+                    bar_attr = curses.color_pair(P_CARD_BLOCKED) | curses.A_BOLD
+                elif frac >= 0.5:
+                    bar_attr = curses.color_pair(P_CARD_WORKING) | curses.A_BOLD
+                elif frac > 0.05:
+                    bar_attr = curses.color_pair(P_CARD_SETTLED)
+                else:
+                    bar_attr = muted | curses.A_DIM
+                status_txt, status_attr = status_map.get(win.get("status"), (win.get("status") or "—", muted))
+                put_cell(cursor_row, px, pname, c_prov2, base)
+                put_cell(cursor_row, wx, win.get("window_label") or "—", c_win, base)
+                put_cell(cursor_row, bx, "█" * full + "░" * (bar_w - full), bar_w + 1, bar_attr)
+                put_cell(cursor_row, bx + bar_w + 1, f"{frac * 100:3.0f}%", 6, base, "r")
+                put_cell(cursor_row, sx, status_txt, c_status, status_attr)
+                cursor_row += 1
+        else:
+            _write(self.stdscr, cursor_row, x + 2, "暂无套餐余量数据", table_w, muted | curses.A_DIM)
+            cursor_row += 1
+
+        # 裁剪：若内容超出 content_clip，只显示到该行，并在其上标出未显示数
+        overflow = ""
+        if cursor_row > content_clip:
+            hidden = cursor_row - content_clip
+            overflow = f" … 还有 {hidden} 行未显示 "
+            cursor_row = content_clip - 1 if len(models) else content_clip
+            _write(self.stdscr, content_clip, x + 2, overflow, box_width - 4, muted | curses.A_DIM)
+
+        note = "每 10 秒刷新 · Esc 关闭"
+        _write(self.stdscr, y + box_height - 2, x + 2, note, box_width - 4, muted | curses.A_DIM)
+        cancel = " 关闭 Esc "
+        cancel_x = x + box_width - 2 - _width(cancel)
+        _write(self.stdscr, y + box_height - 2, cancel_x, cancel, attr=curses.color_pair(P_CARD_MUTED) | curses.A_BOLD)
+        self.hit_buttons.append((y + box_height - 2, y + box_height - 2, cancel_x, cancel_x + _width(cancel) - 1, "usage-close"))
 
     def draw_footer(self, y: int, width: int) -> None:
+        right = "AUTO 1s"
+        right_room = max(0, width - 6 - _width(right))
         if self.rename is not None:
-            left = HELP_RENAME
+            left = _fit(HELP_RENAME, right_room)
             left_attr = curses.color_pair(P_ACCENT) | curses.A_BOLD
         elif self.reclaim is not None:
-            left = HELP_RECLAIM
+            left = _fit(HELP_RECLAIM, right_room)
             left_attr = curses.color_pair(P_ACCENT) | curses.A_BOLD
         elif time.time() < self.message_until and self.message:
-            left = self.message
+            left = _fit(self.message, right_room)
             left_attr = curses.color_pair(P_ACCENT) | curses.A_BOLD
         else:
-            left = HELP_AGENTS if self.view == "agents" else HELP_WINDOWS
+            left = _hint_line(HINT_AGENTS if self.view == "agents" else HINT_WINDOWS, right_room)
             left_attr = curses.color_pair(P_MUTED)
-        _write(self.stdscr, y, 2, left, width - 4, left_attr)
-        right = "AUTO REFRESH  1s"
+        _write(self.stdscr, y, 2, left, right_room, left_attr)
         _right(self.stdscr, y, width - 2, right, curses.color_pair(P_LIVE) | curses.A_BOLD)
 
     def draw(self) -> None:
@@ -1236,7 +1733,7 @@ class Board:
             return
 
         board_top = self.draw_header(height, width)
-        detail_height = 6 if height >= 32 else 0
+        detail_height = self.detail_height(height, self.selected_item(), width)
         footer_y = height - 2
         detail_y = footer_y - detail_height
         board_bottom = detail_y - 1 if detail_height else footer_y - 1
@@ -1263,6 +1760,8 @@ class Board:
             self.draw_reclaim(height, width)
         if self.rename is not None:
             self.draw_rename(height, width)
+        if self.usage is not None:
+            self.draw_usage(height, width)
         self.draw_footer(footer_y, width)
         stdscr.refresh()
 
@@ -1314,6 +1813,14 @@ def _init_colors() -> None:
     }
     for pair_id, (foreground, background) in pairs.items():
         curses.init_pair(pair_id, foreground, background)
+
+    if rich:
+        # 会话标签色：256 色终端才启用；8 色终端静默退回统一卡片配色
+        for offset, slot in enumerate(COLOR_SLOTS):
+            try:
+                curses.init_pair(P_SLOT_BASE + offset, slot["curses"], card_bg)
+            except curses.error:
+                pass
 
 
 _CLICK_MASK = (
@@ -1415,8 +1922,26 @@ def main(stdscr: curses.window) -> None:
         if board.rename is not None:
             _handle_rename_key(board, key)
             continue
+        if board.usage is not None:
+            if key in ("m", "M", "\x1b"):
+                board.usage = None
+                board.flash("用量面板已关闭")
+            continue
         if key in ("q", "Q", "\x1b"):
             break
+        if key in (curses.KEY_PPAGE, "["):
+            board.page_context(-1)
+            continue
+        if key in (curses.KEY_NPAGE, "]", " "):
+            board.page_context(1)
+            continue
+        if key in ("c", "C"):
+            if board.stdscr.getmaxyx()[0] < 32:
+                board.flash("终端太矮 · 放大 popup 才有上下文面板")
+            else:
+                board.toggle_context()
+                board.flash("上下文聚焦已开启" if board.context_focus else "上下文聚焦已关闭")
+            continue
         if key in ("x", "X"):
             board.open_reclaim()
         elif key in ("e", "E"):
@@ -1436,6 +1961,13 @@ def main(stdscr: curses.window) -> None:
         elif key in ("r", "R"):
             board.refresh(force=True)
             board.flash("数据已刷新")
+        elif key in ("m", "M"):
+            usage = (board.snapshot.get("usage") or {}) or {}
+            board.usage = {
+                "usage": usage,
+                "plan": (board.snapshot.get("plan") or {}) or {},
+            }
+            board.flash("模型用量 · 今日")
         elif key in ("\n", "\r"):
             if board.jump():
                 break

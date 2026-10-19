@@ -41,7 +41,7 @@ No window switching, no mouse hunt, no "which tab was that agent in again". `Ctr
 
 ![web cleanup](assets/web-cleanup.png)
 
-**TUI board** (real curses render, redacted demo data): nothing is blocked here, so the board collapses to two columns — *running* and *ready*. The header carries the installed version plus five clickable actions (new tab / new pane / rename / reclaim / the update button that only shows when you are behind), with the real selection state, detail bar, and key hints below.
+**TUI board** (real curses render, redacted demo data): nothing is blocked here, so the board collapses to two columns — *running* and *ready*. The header carries the installed version plus five clickable actions (new tab / new pane / rename / reclaim / the update button that only shows when you are behind), with the real selection state, the live-context panel, and key hints below.
 
 ![tui board](assets/tui-board.png)
 
@@ -51,6 +51,8 @@ No window switching, no mouse hunt, no "which tab was that agent in again". `Ctr
 - **Agent detection** — PI, OMP, Claude, Codex and 20+ others
 - **Structured live progress** — current phase (running a command / editing code / waiting on a subtask / waiting for you…) plus the execution title, tool type, and last-active time
 - **Dynamic waiting column** — zero footprint until an agent stops for you (approval or question), then it appears first and blinks in the header counters
+- **Stable per-session label colors** — every card gets its own accent color the moment it appears and keeps it until the pane is gone, so parallel sessions stay recognizable even when the board reorders (col order itself is now stable too, sorted by pane id)
+- **Readable usage panel** — the `M` overlay renders today's model spend and plan quotas as properly aligned tables with tiered cost highlighting and load-colored quota bars
 - **Click to land** — web or TUI, clicking a card switches Herdr to that workspace/tab/pane and raises the terminal window that hosts Herdr (Ghostty, iTerm2, Terminal, kitty, Alacritty, WezTerm… all detected)
 - **Keyboard *and* mouse in the TUI** — full keyboard control, plus click to select, click again (or double-click) to jump, click a column to switch to it
 - **Reply to an agent from the web** — text goes straight to that agent's terminal (`agent prompt` when idle, simulated keystrokes while it runs), multi-line paste included
@@ -88,8 +90,9 @@ Finish with `herdr server reload-config` and press **`Ctrl+B` `A`**.
 
 - **Dynamic columns** — with nothing blocked you get *running* and *ready*; the moment an agent stops for you, the waiting column appears and takes first place
 - **Virtual scrollbar** — a column with more cards than fit grows a colored scrollbar whose thumb size and position track the list
-- **Structured cards** — title first (the headline) → `▸ phase · execution title` → status/tool/pane id; the driving framework (omp / pi / …) is demoted to a lowercase tag on the card's top-right border, with the workspace sitting beside the title
-- **Detail bar** (when the terminal is tall enough) — current phase, execution title, location path, recent output digest
+- **Structured cards** — title first (the headline) → `▸ phase · execution title` → `status · how long ago · tool` plus the pane id, so `执行中 · 3m 前 · WRITE` reads as "this agent went quiet three minutes ago", not "running for three minutes"; the driving framework (omp / pi / …) is demoted to a lowercase tag on the card's top-right border, with the workspace sitting beside the title
+- **Live context panel** — the bottom panel follows the selected card and shows the agent's *latest* output as readable text, not a one-line digest: header (title, framework, provider/model, sub-agent count, status) → `▸ phase · execution title` with tool and freshness (`↻ 30s 前`) → the last assistant message re-wrapped to the panel width, original line breaks and indentation kept, Markdown noise stripped → breadcrumb (`workspace › tab › pane › 静默 12m`) on the bottom border
+- **It grows with what you select** — a six-row minimum that expands up to fourteen rows only when the text needs it, and never by eating the third card of a column; `C` toggles *context focus* (the panel takes over half the screen) when you want to read a long reply, `PgUp` / `PgDn` (or `[` / `]` / `Space`, or clicking the panel) page through it. New output keeps you pinned to the newest line unless you have scrolled up
 - **`Enter` lands** — jumps to the pane and **closes the board immediately**, leaving the session you aimed at in front of you; on failure the board stays and tells you why
 - **Window view** — `Tab` or `v` switches to the SSH/shell grid, press again to switch back
 - **Reclaim idle panes** — `X` (or the `⌫ 释放闲置` button in the header) opens the reclaim panel; tick the panes you want gone and press `Enter` twice to close them and free the resources
@@ -102,9 +105,10 @@ The TUI is keyboard-first but never keyboard-only:
 
 | Gesture | Effect |
 | --- | --- |
-| Click a card | Select it (instant detail bar update) |
+| Click a card | Select it (the live-context panel follows instantly) |
 | Click the selected card again, or double-click any card | Jump to that pane and close the board |
 | Click a column's empty area | Make that column active |
+| Click inside the live-context panel | Page down through the output; at the bottom it wraps back to the top |
 | Click `⌫ 释放闲置` in the header | Open the reclaim panel (its rows, threshold chip and buttons are all clickable) |
 | Click one of the three chips in the rename panel | Switch between pane / tab / workspace |
 | Click `＋ 新 Tab` / `⬓ 新 Pane` in the header | Create one in / beside the selected card, jump there and close the board |
@@ -171,6 +175,8 @@ Environment overrides: `HERDR_PORTAL_REPO` (default `loofare/herdr-portal`), `HE
 | --- | --- |
 | `↑ ↓ ← →` / `hjkl` | Move between cards / columns |
 | `Enter` | Jump to the pane and close the board |
+| `PgUp` / `PgDn` (`[` / `]` / `Space`) | Page the live-context panel; the panel border shows the current page |
+| `C` | Context focus — grow / shrink the live-context panel |
 | `Tab` / `v` | Agent board ↔ window view |
 | `1-3` | Jump straight to a column |
 | `r` | Refresh now |

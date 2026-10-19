@@ -85,6 +85,10 @@
             <span class="ts-label">AGENTS ONLINE</span>
             <span class="ts-value" id="agents-online">—</span>
           </div>
+          <button class="topbar-usage" id="usage-open" title="今日模型用量">
+            <span class="ts-label">今日用量</span>
+            <span class="ts-value" id="usage-cost">—</span>
+          </button>
         </div>
         <div class="live-panel">
           <time id="clock">--:--:--</time>
@@ -149,6 +153,23 @@
         <span class="cleanup-msg" id="cleanup-msg" role="status"></span>
         <button class="cleanup-cancel" id="cleanup-cancel">取消</button>
         <button class="cleanup-apply" id="cleanup-apply">释放选中</button>
+      </footer>
+    </div>
+  </div>
+  <div class="cleanup-backdrop usage-backdrop" id="usage" hidden>
+    <div class="cleanup-dialog usage-dialog" role="dialog" aria-modal="true" aria-labelledby="usage-title" tabindex="-1">
+      <header class="cleanup-head">
+        <div class="cleanup-head-copy">
+          <h2 id="usage-title">今日模型用量</h2>
+          <p class="cleanup-sub" id="usage-sub">统计今日所有 Agent 会话的 token 与成本</p>
+        </div>
+        <button class="cleanup-close" id="usage-close" title="关闭 (Esc)">✕</button>
+      </header>
+      <div class="usage-total" id="usage-total"></div>
+      <div class="cleanup-body usage-body" id="usage-body"></div>
+      <footer class="cleanup-foot">
+        <span class="cleanup-selected" id="usage-foot">窗口每 10 秒刷新</span>
+        <button class="cleanup-cancel" id="usage-cancel">关闭</button>
       </footer>
     </div>
   </div>

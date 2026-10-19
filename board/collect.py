@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -59,6 +60,17 @@ PREFIX_RE = re.compile(r"^(?:[π•·>›\-—]\s*)+")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9:_-]+$")
 
 _session_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+# 视作「Sub Agent 调用」的工具名：omp=task/agent，pi=subagent，claude=Task
+SUBAGENT_TOOL_NAMES = frozenset({"task", "agent", "subagent", "Task"})
+_SUBAGENT_SEEN_CALLS: dict[str, set[str]] = {}  # session_path -> 见过的全部调用 ID
+_SUBAGENT_OPEN: dict[str, set[str]] = {}  # session_path -> 未闭合调用 ID（跨 tail 窗口保留）
+
+# 主 agent 让出控制权（idle/done）后，子代理仍在自己的会话文件里干活。
+# 判据：子会话文件比主会话文件新 —— 说明这一格最后发生的事不在主 agent 视野里。
+# 上限取 600s：实测 29 个会话 30842 个子代理事件间隔 p99=420s / p99.9=513s，
+# 覆盖 99.9% 的「子代理正在跑长工具、暂时不写盘」的静默期。
+BACKGROUND_FRESH_SECONDS = 600
 
 # ---------- 闲置回收（Reclaim） ----------
 
@@ -303,6 +315,13 @@ def read_session_extra(session_path: str | None) -> dict[str, Any]:
         "last_event_kind": "",
         "last_active": stat.st_mtime,
         "session_started": None,
+        # 主模型 / 供应商 / Sub Agent / 用量（各 Agent 会话格式统一归一化到这里）
+        "model": "",
+        "provider": "",
+        "subagent_total": 0,
+        "subagent_running": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
     }
     try:
         fallback_title = ""
@@ -326,6 +345,7 @@ def read_session_extra(session_path: str | None) -> dict[str, Any]:
         latest_tool_at = 0.0
         latest_result_at = 0.0
         last_event_kind = ""
+        open_subagents: set[str] = _SUBAGENT_OPEN.setdefault(session_path, set())
         for raw in tail.splitlines():
             try:
                 event = json.loads(raw)
@@ -335,6 +355,16 @@ def read_session_extra(session_path: str | None) -> dict[str, Any]:
             if parsed:
                 extra["last_active"] = parsed
             event_type = event.get("type")
+            if event_type == "model_change" and event.get("model"):
+                extra["model"] = str(event["model"])
+                if event.get("provider") or event.get("providerID"):
+                    extra["provider"] = str(event.get("provider") or event.get("providerID"))
+            elif event_type == "session_meta" and isinstance(event.get("payload"), dict):
+                meta_model = (event["payload"].get("model") or "").strip()
+                if meta_model:
+                    extra["model"] = meta_model  # codex: turn_context/session_meta 带模型
+            elif event_type == "turn_context" and event.get("model"):
+                extra["model"] = str(event["model"])  # codex 每轮上下文都声明模型
             if event_type == "title" and event.get("title"):
                 extra["session_title"] = event["title"]
                 continue
@@ -343,6 +373,10 @@ def read_session_extra(session_path: str | None) -> dict[str, Any]:
                 latest_tool = _tool_activity(data, last_assistant_text)
                 latest_tool_at = parse_iso(data.get("startedAt")) or parsed or latest_tool_at
                 last_event_kind = "tool"
+                if data.get("toolName") in SUBAGENT_TOOL_NAMES:
+                    call_id = str(data.get("toolCallId") or parsed)
+                    open_subagents.add(call_id)
+                    _SUBAGENT_SEEN_CALLS.setdefault(session_path, set()).add(call_id)
                 continue
             if event_type != "message":
                 continue
@@ -357,15 +391,45 @@ def read_session_extra(session_path: str | None) -> dict[str, Any]:
                     extra["last_output"] = text[:1500]
                     extra["last_output_at"] = parsed or None
                     last_event_kind = "assistant"
+                model_name = message.get("model")
+                if model_name:
+                    extra["model"] = str(model_name)  # omp/pi/claude: assistant 消息自带模型
+                provider_name = message.get("provider") or message.get("providerID")
+                if provider_name:
+                    extra["provider"] = str(provider_name)
+                usage = message.get("usage") or {}
+                if isinstance(usage, dict):
+                    extra["tokens_in"] += int(usage.get("input") or usage.get("input_tokens") or 0)
+                    out_val = usage.get("output") or usage.get("output_tokens") or 0
+                    extra["tokens_out"] += int(out_val)
                 if isinstance(content, list):
                     for part in content:
-                        if isinstance(part, dict) and part.get("type") == "toolCall":
+                        if not isinstance(part, dict):
+                            continue
+                        part_type = part.get("type")
+                        call_id = str(part.get("id") or part.get("toolCallId") or "")
+                        if part_type == "toolCall":
                             latest_tool = _tool_activity(part, last_assistant_text)
                             latest_tool_at = parsed or latest_tool_at
                             last_event_kind = "tool"
+                            if part.get("name") in SUBAGENT_TOOL_NAMES:
+                                open_subagents.add(call_id or f"{parsed}")
+                                # 无论是否闭合都计入 seen（tail 窗口内见到的调用都算历史）
+                                _SUBAGENT_SEEN_CALLS.setdefault(session_path, set()).add(call_id or f"{parsed}")
+                        elif (
+                            part_type == "toolUse"
+                            and part.get("name") in SUBAGENT_TOOL_NAMES
+                        ):
+                            open_subagents.add(call_id)  # claude Task 工具的 toolUse 块
+                            _SUBAGENT_SEEN_CALLS.setdefault(session_path, set()).add(call_id)
             elif role == "toolResult":
                 latest_result_at = parsed or latest_result_at
                 last_event_kind = "result"
+                open_subagents.discard(str(message.get("toolCallId") or ""))
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            open_subagents.discard(str(part.get("toolCallId") or ""))
 
         extra["preview"] = extra["headline"]
         extra["tool"] = latest_tool.get("tool", "")
@@ -373,6 +437,11 @@ def read_session_extra(session_path: str | None) -> dict[str, Any]:
         extra["tool_title"] = latest_tool.get("title", "")
         extra["tool_pending"] = bool(latest_tool and latest_tool_at >= latest_result_at)
         extra["last_event_kind"] = last_event_kind
+        # 累计：本窗口内新见到的调用 ID 记入总账（用 set 去重，避免重复计数）
+        seen_calls = _SUBAGENT_SEEN_CALLS.setdefault(session_path, set())
+        seen_calls |= open_subagents
+        extra["subagent_total"] = len(seen_calls)
+        extra["subagent_running"] = len(open_subagents)
     except OSError:
         pass
 
@@ -380,6 +449,41 @@ def read_session_extra(session_path: str | None) -> dict[str, Any]:
     if len(_session_cache) > 64:  # 简单 FIFO 上限，防止会话路径累积
         _session_cache.pop(next(iter(_session_cache)), None)
     return extra
+
+
+def background_running(session_path: str, now: float) -> tuple[int, float | None]:
+    """(仍在写盘的子会话数, 最近一次写盘时刻)；没有后台活动时返回 (0, None)。
+
+    不能用 subagent_running 代替：omp 的 task 工具是异步派发，实测调用 0.0~0.2s
+    就闭合并返回 job ID，而子代理会继续跑几十分钟。未闭合调用数只标「派发瞬间」。
+    """
+    root = Path(session_path)
+    try:
+        root_mtime = root.stat().st_mtime
+    except OSError:
+        return 0, None
+
+    count = 0
+    latest = 0.0
+    try:
+        with os.scandir(root.with_suffix("")) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".jsonl"):
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > root_mtime:
+                    count += 1
+                    if mtime > latest:
+                        latest = mtime
+    except OSError:  # 没有子会话目录：绝大多数会话的常态
+        return 0, None
+
+    if not count or now - latest > BACKGROUND_FRESH_SECONDS:
+        return 0, None
+    return count, latest
 
 
 def classify_window(pane: dict[str, Any]) -> tuple[str, str]:
@@ -490,6 +594,21 @@ def normalize_item(
             break
     activity = build_activity(extra, status, is_agent, title, terminal_title)
     last_active = extra.get("last_active")
+
+    # herdr 的 agent_status 只描述主 agent 这一回合的生命周期：主 agent 一 yield
+    # 就是 idle，未被看过则升级成 done。此时子代理可能还在跑，看板不能报「已完成」。
+    background_count = 0
+    if is_agent and session_path and status in {"idle", "done"}:
+        background_count, background_at = background_running(session_path, now)
+        if background_count:
+            status_label = f"后台执行中 · {background_count}"
+            activity = {
+                **activity,
+                "phase": "后台子代理执行中",
+                "active": True,
+                "tone": "working",
+            }
+            last_active = max(last_active or 0.0, background_at or 0.0)
     return {
         "id": pane.get("pane_id"),
         "kind": "agent" if is_agent else "window",
@@ -528,8 +647,140 @@ def normalize_item(
         "last_output_at": extra.get("last_output_at"),
         "last_output_label": human_age(extra.get("last_output_at"), now),
         "terminal_title_raw": terminal_title_raw,
+        # 主模型 / 供应商 / Sub Agent / 用量
+        "model": _short_model(str(extra.get("model") or "")) if is_agent else "",
+        "provider": _provider_label(str(extra.get("provider") or "")) if is_agent else "",
+        "subagent_total": int(extra.get("subagent_total") or 0),
+        "subagent_running": int(extra.get("subagent_running") or 0) if is_agent else 0,
+        "tokens_in": int(extra.get("tokens_in") or 0),
+        "tokens_out": int(extra.get("tokens_out") or 0),
         "revision": pane.get("revision"),
+        "background_running": background_count,
     }
+
+
+PROVIDER_LABELS = {
+    "opencode-go": "OpenCode",
+    "deepseek": "DeepSeek",
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "openai-codex": "Codex",
+    "google": "Google",
+    "xai-oauth": "xAI",
+    "kimi-code": "Kimi",
+    "google-gemini-cli": "Gemini CLI",
+    "google-vertex": "Vertex",
+    "google-antigravity": "Antigravity",
+}
+
+
+def _provider_label(provider: str) -> str:
+    """供应商标签：opencode-go → OpenCode，deepseek → DeepSeek。"""
+    if not provider:
+        return ""
+    key = provider.split(":")[0].strip().lower()
+    return PROVIDER_LABELS.get(key, provider[:16])
+
+def _short_model(model: str) -> str:
+    """压缩模型名用于角标展示：provider 前缀去掉，只留可辨识的型号段。"""
+    if not model or model == "<synthetic>":
+        return ""
+    text = model.split("/", 1)[-1]  # opencode-go/ox-alpha-free → ox-alpha-free
+    text = re.sub(r"^(claude|openai|google|anthropic)[-/]", "", text, flags=re.IGNORECASE)
+    return text[:28]
+
+
+# ---------- 会话标签色（每个 pane 一个稳定颜色） ----------
+
+# 8 个槽位：curses 前景色（256 色）/ 网页端 HSL 色相。刻意避开状态四色
+# （blocked 红 / working 黄 / settled 绿 / window 青）——标签色只回答「这是哪个会话」，
+# 状态仍由各自的状态色表达。并发 ≤8 时保证互不相同。
+COLOR_SLOT_COUNT = 8
+COLOR_SLOTS = (
+    {"curses": 39, "hue": 200},   # 天蓝
+    {"curses": 176, "hue": 300},  # 兰紫
+    {"curses": 209, "hue": 18},   # 橙
+    {"curses": 79, "hue": 145},   # 翠绿
+    {"curses": 212, "hue": 320},  # 粉
+    {"curses": 141, "hue": 255},  # 紫
+    {"curses": 186, "hue": 60},   # 卡其黄
+    {"curses": 189, "hue": 225},  # 雪青（低饱和）
+)
+# pane 消失超过宽限期才回收槽位：快照抖动 / 短暂掉线不会让颜色跳变。
+COLOR_GRACE_SECONDS = 1800.0
+_color_saved_at = 0.0
+
+
+def _colors_path() -> Path:
+    return _state_dir() / "colors.json"
+
+
+def _read_colors() -> dict[str, dict[str, Any]]:
+    """每次分配前重读磁盘：TUI 与 web 服务是两个进程，磁盘是唯一的收敛点。"""
+    try:
+        raw = json.loads(_colors_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(pane_id): record
+        for pane_id, record in raw.items()
+        if isinstance(record, dict) and isinstance(record.get("slot"), int)
+    }
+
+
+def _write_colors(records: dict[str, dict[str, Any]]) -> None:
+    path = _colors_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def assign_color_slots(items: list[dict[str, Any]], now: float) -> None:
+    """给每个 pane 固定一个标签色槽位：存活期间不变，结束（超宽限期）后才释放。
+
+    新 pane 取当前占用最少的槽位（同数取最小序号），遍历按 pane_id 排序，
+    所以两个看板进程从同一份磁盘状态出发会推导出同一个结果。
+    """
+    global _color_saved_at
+    records = _read_colors()
+    live_ids = sorted({str(item.get("pane_id") or "") for item in items} - {""})
+    live = set(live_ids)
+    by_id = {str(item.get("pane_id") or ""): item for item in items}
+    held: dict[int, int] = {}
+    for pane_id in live_ids:
+        record = records.get(pane_id)
+        if record is not None and 0 <= int(record.get("slot", -1)) < COLOR_SLOT_COUNT:
+            slot = int(record["slot"])
+            held[slot] = held.get(slot, 0) + 1
+    assigned = False
+    for pane_id in live_ids:
+        record = records.get(pane_id)
+        if record is None or not 0 <= int(record.get("slot", -1)) < COLOR_SLOT_COUNT:
+            slot = min(range(COLOR_SLOT_COUNT), key=lambda n: held.get(n, 0))
+            record = {"slot": slot}
+            records[pane_id] = record
+            held[slot] = held.get(slot, 0) + 1
+            assigned = True
+        record["seen"] = now
+        slot = int(record["slot"])
+        by_id[pane_id]["color_slot"] = slot
+        by_id[pane_id]["color_hue"] = COLOR_SLOTS[slot]["hue"]
+    stale = [
+        pane_id
+        for pane_id, record in records.items()
+        if pane_id not in live and now - float(record.get("seen") or 0.0) > COLOR_GRACE_SECONDS
+    ]
+    for pane_id in stale:
+        del records[pane_id]
+    if assigned or stale or now - _color_saved_at > 30.0:
+        _write_colors(records)
+        _color_saved_at = now
 
 
 def _fingerprint(snapshot: dict[str, Any]) -> str:
@@ -551,7 +802,14 @@ def _fingerprint(snapshot: dict[str, Any]) -> str:
             "focused": item.get("focused"),
             "last_output": item.get("last_output"),
             "last_output_at": item.get("last_output_at"),
+            "model": item.get("model"),
+            "provider": item.get("provider"),
+            "subagent_running": item.get("subagent_running"),
+            "subagent_total": item.get("subagent_total"),
+            "tokens_in": item.get("tokens_in"),
+            "tokens_out": item.get("tokens_out"),
             "revision": item.get("revision"),
+            "color_slot": item.get("color_slot"),
         }
         for item in snapshot.get("items") or []
     ]
@@ -564,6 +822,17 @@ def _fingerprint(snapshot: dict[str, Any]) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
+_NATURAL_SPLIT_RE = re.compile(r"(\d+)")
+
+
+def _pane_order_key(item: dict[str, Any]) -> tuple:
+    """按 pane_id 自然排序（pD2 在 pD10 前），列内顺序不再随刷新抖动。"""
+    return tuple(
+        int(part) if part.isdigit() else part
+        for part in _NATURAL_SPLIT_RE.split(str(item.get("pane_id") or ""))
+    )
+
+
 def collect() -> dict[str, Any]:
     now = time.time()
     payload = run_herdr("api", "snapshot")
@@ -572,17 +841,20 @@ def collect() -> dict[str, Any]:
     tabs = {item["tab_id"]: item for item in snapshot.get("tabs") or [] if item.get("tab_id")}
     panes = snapshot.get("panes") or []
     items = [normalize_item(pane, workspaces, tabs, now) for pane in panes]
+    items.sort(key=_pane_order_key)  # herdr 快照次序会抖动，排序后卡片位置在刷新间稳定
     track_pane_activity(panes, now)
     for item in items:
         since = (_activity.get(item.get("pane_id")) or {}).get("since")
         item["quiet_since"] = since
         item["quiet_seconds"] = int(max(0.0, now - since)) if since else 0
         item["quiet_label"] = human_age(since, now)
+    assign_color_slots(items, now)
     counts = {
         "blocked": 0,
         "working": 0,
         "idle": 0,
         "done": 0,
+        "background": 0,  # 主 agent 已 idle/done，但子代理还在跑
         "unknown": 0,
         "windows": 0,
         "agents": 0,
@@ -593,7 +865,9 @@ def collect() -> dict[str, Any]:
             counts["windows"] += 1
         else:
             counts["agents"] += 1
-            if item["status"] in counts:
+            if item.get("background_running"):
+                counts["background"] += 1
+            elif item["status"] in counts:
                 counts[item["status"]] += 1
     columns = {
         "blocked": [item for item in items if item["column"] == "blocked"],
@@ -624,6 +898,16 @@ def collect() -> dict[str, Any]:
         )
         bucket["items"].append(item)
 
+    usage = None
+    try:
+        usage = usage_summary()
+    except Exception:  # noqa: BLE001 - 用量是增强信息，失败不拖垮看板
+        usage = None
+    plan = None
+    try:
+        plan = plan_summary()
+    except Exception:  # noqa: BLE001 - 套餐余量是增强信息，失败不拖垮看板
+        plan = None
     return {
         "ok": True,
         "fingerprint": _fingerprint({"items": items, "counts": counts, "focused": {
@@ -645,6 +929,8 @@ def collect() -> dict[str, Any]:
         "spaces": list(spaces.values()),
         "workspaces": snapshot.get("workspaces") or [],
         "tabs": snapshot.get("tabs") or [],
+        "usage": usage,
+        "plan": plan,
     }
 
 
@@ -971,6 +1257,9 @@ def _reclaim_verdict(
     if item.get("kind") == "agent":
         if item.get("status") in {"working", "blocked"}:
             return "protected", "", "Agent 运行中", process_label
+        if item.get("background_running"):
+            # 主 agent 空闲但子代理还在跑，关掉 pane 会连着后台一起杀。
+            return "protected", "", "后台子代理运行中", process_label
         return "candidate", "agent", "空闲 Agent", process_label
     if not shell_only:
         return "protected", "", f"运行中 · {process_label}", process_label
@@ -1348,6 +1637,252 @@ def launch_update() -> dict[str, Any]:
     result = launch_task(plan["command"], plan["label"], cwd=str(PLUGIN_ROOT))
     result.update({"mode": plan["mode"], "hint": plan["hint"]})
     return result
+
+
+# ---------- 模型用量聚合（今日 Usage） ----------
+
+_USAGE_ROOTS = (
+    ("omp", Path.home() / ".omp" / "agent" / "sessions"),
+    ("pi", Path.home() / ".pi" / "agent" / "sessions"),
+    ("claude", Path.home() / ".claude" / "projects"),
+    ("codex", Path.home() / ".codex" / "sessions"),
+)
+
+
+def _local_midnight() -> float:
+    now = datetime.now()
+    start = datetime(now.year, now.month, now.day)
+    return start.timestamp()
+
+
+def _today_session_files() -> list[tuple[str, Path]]:
+    """今日写入过的会话文件（按框架归类），只挑 jsonl。"""
+    cutoff = _local_midnight()
+    found: list[tuple[str, Path]] = []
+    for family, root in _USAGE_ROOTS:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.jsonl"):
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    found.append((family, path))
+            except OSError:
+                continue
+    return found
+
+
+# 每个文件解析结果缓存：path -> (mtime, size, {"model","requests","in","out","cost"})
+_file_usage_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
+# 全局聚合结果缓存 + 时间戳（避免每次 refresh 重扫目录）
+_usage_memo: dict[str, Any] = {}
+_usage_memo_at = 0.0
+_USAGE_TTL = 10.0
+
+
+def _parse_usage_file(family: str, path: Path) -> dict[str, Any]:
+    """解析单个会话文件的今日 token/成本累计（按模型分桶）。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    cached = _file_usage_cache.get(str(path))
+    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    acc: dict[str, Any] = {"model": "", "provider": "", "requests": 0, "in": 0, "out": 0, "cost": 0.0}
+    model = ""
+    # claude/codex 会话消息里没有 provider 字段，按框架归类供应商
+    provider = {"claude": "anthropic", "codex": "openai"}.get(family, "")
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type")
+                if family in ("omp", "pi"):
+                    if etype == "message":
+                        msg = event.get("message") or {}
+                        if msg.get("role") == "assistant" and msg.get("usage"):
+                            model = str(msg.get("model") or model)
+                            if msg.get("provider"):
+                                provider = str(msg["provider"])
+                            u = msg["usage"]
+                            acc["in"] += int(u.get("input") or 0)
+                            acc["out"] += int(u.get("output") or 0)
+                            cost = (u.get("cost") or {}).get("total", 0) if isinstance(u.get("cost"), dict) else 0
+                            acc["cost"] += float(cost or 0)
+                            acc["requests"] += 1
+                    elif etype == "model_change" and event.get("model"):
+                        model = str(event["model"])
+                elif family == "claude":
+                    if etype == "assistant":
+                        msg = event.get("message") or {}
+                        usage = msg.get("usage") or {}
+                        if usage:
+                            model = str(msg.get("model") or model)
+                            acc["in"] += int(usage.get("input_tokens") or 0) + int(
+                                usage.get("cache_read_input_tokens") or 0
+                            ) + int(usage.get("cache_creation_input_tokens") or 0)
+                            acc["out"] += int(usage.get("output_tokens") or 0)
+                            acc["requests"] += 1
+                    elif etype == "system" and event.get("model"):
+                        model = str(event["model"])
+                elif family == "codex":
+                    if etype == "turn_context" and isinstance(event.get("payload"), dict):
+                        model = str((event["payload"].get("model") or "").strip() or model)
+                    elif etype == "event_msg" and (event.get("payload") or {}).get("type") == "token_count":
+                        # token_count 为会话累计快照，取最后一个作为总额
+                        info = (event["payload"].get("info") or {}).get("total_token_usage") or {}
+                        acc["in"] = int(info.get("input_tokens") or 0)
+                        acc["out"] = int(info.get("output_tokens") or 0)
+                        acc["requests"] = max(acc["requests"], 1)
+    except OSError:
+        pass
+    acc["model"] = model
+    acc["provider"] = provider
+    _file_usage_cache[str(path)] = (stat.st_mtime, stat.st_size, acc)
+    return acc
+
+
+def usage_summary() -> dict[str, Any]:
+    """今日各模型用量（token 输入/输出 + 成本），带 TTL 缓存。"""
+    global _usage_memo, _usage_memo_at
+    now = time.time()
+    if _usage_memo and now - _usage_memo_at < _USAGE_TTL:
+        return _usage_memo
+    cutoff = _local_midnight()
+    by_model: dict[str, dict[str, Any]] = {}
+    sessions = 0
+    for family, path in _today_session_files():
+        parsed = _parse_usage_file(family, path)
+        if not parsed.get("model"):
+            continue
+        sessions += 1
+        model = _short_model(str(parsed["model"]))
+        provider = _provider_label(str(parsed["provider"] or ""))
+        bucket_key = f"{provider}::{model}"
+        bucket = by_model.setdefault(
+            bucket_key,
+            {"model": model, "provider": provider, "family": family, "requests": 0, "tokens_in": 0, "tokens_out": 0, "cost": 0.0},
+        )
+        bucket["requests"] += parsed["requests"]
+        bucket["tokens_in"] += parsed["in"]
+        bucket["tokens_out"] += parsed["out"]
+        bucket["cost"] += parsed["cost"]
+    models = sorted(by_model.values(), key=lambda b: (-b["cost"], -b["tokens_in"]))
+    total_cost = sum(b["cost"] for b in models)
+    total_in = sum(b["tokens_in"] for b in models)
+    total_out = sum(b["tokens_out"] for b in models)
+    total_requests = sum(b["requests"] for b in models)
+    _usage_memo = {
+        "window": "today",
+        "since": datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d"),
+        "updated_at": time.strftime("%H:%M:%S"),
+        "sessions": sessions,
+        "models": models,
+        "total": {
+            "tokens_in": total_in,
+            "tokens_out": total_out,
+            "cost": total_cost,
+            "requests": total_requests,
+        },
+    }
+    _usage_memo_at = now
+    return _usage_memo
+
+
+# ---------- 套餐用量 / 余量（plan quota） ----------
+
+_OMP_DB = Path.home() / ".omp" / "agent" / "agent.db"
+# 每个供应商取最新一条套餐记录（used_fraction 表示该窗口已用比例）
+_plan_memo: dict[str, Any] = {}
+_plan_memo_at = 0.0
+_PLAN_TTL = 15.0
+
+# 窗口显示名：5 小时 / 每周 / 每月
+_WINDOW_LABELS = {
+    "rolling-5h": "5h",
+    "weekly": "周",
+    "weekly_limit": "周",
+    "monthly": "月",
+    "monthly_limit": "月",
+    "7 days": "7天",
+    "7 day": "7天",
+    "5 hour": "5h",
+}
+
+
+def _win_label(window_label: str) -> str:
+    key = (window_label or "").strip().lower()
+    return _WINDOW_LABELS.get(key, (window_label or "")[:12])
+
+
+def plan_summary() -> dict[str, Any]:
+    """各供应商套餐窗口的用量/余量（来自 omp auth-broker 采样的 usage_history）。
+
+    每条记录含 used_fraction（已用比例）：0=完全未用，1=已耗尽。
+    返回按供应商聚合、按窗口分组的最新快照。
+    """
+    global _plan_memo, _plan_memo_at
+    now = time.time()
+    if _plan_memo and now - _plan_memo_at < _PLAN_TTL:
+        return _plan_memo
+    result: dict[str, Any] = {"providers": [], "window": "plan-live"}
+    rows: list[dict[str, Any]] = []
+    try:
+        con = sqlite3.connect(f"file:{_OMP_DB}?mode=ro", uri=True)
+        try:
+            cur = con.execute(
+                "SELECT provider, account_key, label, window_label, used_fraction, status, resets_at, recorded_at "
+                "FROM usage_history ORDER BY recorded_at DESC"
+            )
+            for provider, account_key, label, window_label, used, status, resets_at, recorded_at in cur.fetchall():
+                rows.append({
+                    "provider": provider,
+                    "account_key": account_key,
+                    "label": label,
+                    "window_label": window_label,
+                    "used_fraction": float(used or 0),
+                    "status": status,
+                    "resets_at": resets_at,
+                    "recorded_at": recorded_at,
+                })
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 - 套餐信息读取失败不致命
+        rows = []
+    # 按 (provider, window_label) 只保留最新一条（recorded_at 最大）
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (row["provider"], row["window_label"])
+        cur = latest.get(key)
+        if cur is None or row["recorded_at"] > cur["recorded_at"]:
+            latest[key] = row
+    providers: dict[str, Any] = {}
+    for (provider, window_label), row in latest.items():
+        bucket = providers.setdefault(provider, {"provider": provider, "windows": []})
+        if any(w["window_label"] == window_label for w in bucket["windows"]):
+            continue
+        bucket["windows"].append({
+            "window_label": _win_label(window_label),
+            "label": row["label"],
+            "used_fraction": row["used_fraction"],
+            "status": row["status"],
+            "resets_at": row["resets_at"],
+        })
+    for provider, bucket in providers.items():
+        bucket["windows"].sort(key=lambda w: _window_rank(w["window_label"]))
+    result["providers"] = sorted(providers.values(), key=lambda b: b["provider"])
+    _plan_memo = result
+    _plan_memo_at = now
+    return result
+
+
+def _window_rank(label: str) -> int:
+    """窗口排序权重：5h(0) < 周(1) < 月(2) < 其它(3)。"""
+    order = {"5h": 0, "周": 1, "7天": 1, "月": 2}
+    return order.get(label, 3)
 
 
 if __name__ == "__main__":

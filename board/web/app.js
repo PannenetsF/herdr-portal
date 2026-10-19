@@ -75,9 +75,12 @@ function card(item) {
   const replyBtn = isAgent
     ? `<button class="card-reply" data-reply="${esc(item.pane_id)}" title="回复该 Agent" aria-label="回复该 Agent">${ICONS.reply}</button>`
     : "";
-  const tone = isAgent
-    ? ["idle", "done"].includes(item.status) ? "settled" : item.status || "unknown"
-    : "window";
+  // 主 agent 空闲但子代理还在跑：视觉上按「执行中」处理，别让人误读成收工
+  const tone = !isAgent
+    ? "window"
+    : item.background_running
+      ? "working"
+      : ["idle", "done"].includes(item.status) ? "settled" : item.status || "unknown";
   const kindIcon = isAgent ? ICONS.agent : ICONS.window;
   const strongTitle = item.secondary_title || item.title;
   const description =
@@ -85,13 +88,25 @@ function card(item) {
   const descHtml = description ? `<p class="card-desc">${esc(description)}</p>` : "";
   const cwd = item.project || item.cwd_short || "";
   const metaParts = [item.tab, cwd, item.last_active_label].filter(Boolean);
-  // 框架标签（OMP / PI / Claude…）退居角落：小号、弱化、小写，不再占整行
-  const cornerTag = item.agent_label
-    ? `<span class="card-corner" title="框架：${esc(item.agent_label)}">${kindIcon}<span class="card-corner-text">${esc(String(item.agent_label).toLowerCase())}</span></span>`
+  // 框架标签（OMP / PI / Claude…）+ 供应商 + 主模型 + Sub Agent 数：小号、弱化、小写，退居角落
+  const model = String(item.model || "").toLowerCase();
+  const provider = String(item.provider || "").trim();
+  const subTotal = Number(item.subagent_total || 0);
+  const subRunning = Number(item.subagent_running || 0);
+  const subText = subTotal
+    ? (subRunning ? ` · ⧉${subRunning}▸` : ` · ⧉${subTotal}`)
     : "";
+  const cornerTitle = `框架：${esc(item.agent_label)}${provider ? ` · 供应商：${esc(provider)}` : ""}${model ? ` · 模型：${esc(item.model)}` : ""}${subTotal ? ` · Sub Agent：${subTotal}` : ""}`;
+  const cornerTag = item.agent_label
+    ? `<span class="card-corner" title="${cornerTitle}">${kindIcon}<span class="card-corner-text">${esc(String(item.agent_label).toLowerCase())}${provider ? `<b class="card-provider">${esc(provider)}</b>` : ""}${model ? `<b class="card-model">·${esc(model)}</b>` : ""}${subText ? `<b class="card-sub">${subText}</b>` : ""}</span></span>`
+    : "";
+  // 会话标签色：color_hue 由后端按 pane 固定分配，会话存活期间不变
+  const slotAttrs =
+    Number.isInteger(item.color_slot) && Number.isInteger(item.color_hue)
+      ? ` data-slot="${item.color_slot}" style="--slot-h:${item.color_hue}"`
+      : "";
   return `
-    <article class="card tone-${esc(tone)} ${item.focused ? "focused" : ""} ${selected ? "selected" : ""}"
-      data-pane="${esc(item.pane_id)}"
+    <article class="card tone-${esc(tone)} ${item.focused ? "focused" : ""} ${selected ? "selected" : ""}"${slotAttrs}
       data-active="${item.activity_active ? "true" : "false"}"
       tabindex="0"
       aria-label="${esc(strongTitle + " · " + item.agent_label + " · " + item.status_label)}"
@@ -138,12 +153,39 @@ function setHeaderStatus() {
     sys.textContent = "LIVE";
     sys.classList.remove("err");
     $("agents-online").textContent = state.snapshot?.counts?.agents ?? 0;
+    updateUsageReadout(state.snapshot?.usage);
   } else {
     sys.textContent = "OFFLINE";
     sys.classList.add("err");
     const agents = state.snapshot?.counts?.agents;
     $("agents-online").textContent = agents == null ? "—" : agents;
+    $("usage-cost").textContent = "—";
   }
+}
+
+function fmtTokens(n) {
+  const v = Number(n || 0);
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + "k";
+  return String(Math.round(v));
+}
+
+function fmtCost(v) {
+  const n = Number(v || 0);
+  if (n >= 100) return "$" + n.toFixed(1);
+  if (n >= 1) return "$" + n.toFixed(2);
+  if (n >= 0.01) return "$" + n.toFixed(3);
+  return n > 0 ? "$" + n.toFixed(4) : "$0";
+}
+
+function updateUsageReadout(usage) {
+  const el = $("usage-cost");
+  if (!el) return;
+  if (!usage || !usage.total) {
+    el.textContent = "—";
+    return;
+  }
+  el.textContent = `${fmtTokens(usage.total.tokens_in + usage.total.tokens_out)} tok · ${fmtCost(usage.total.cost)}`;
 }
 
 function renderFilters(snapshot) {
@@ -277,6 +319,7 @@ function render(snapshot, force = false) {
   $("pulse").classList.remove("err");
   $("meta").textContent = `v${snapshot.version || "?"} · ${snapshot.updated_at || ""}`;
   setHeaderStatus();
+  if (!$("usage").hidden) renderUsageModal(snapshot.usage, snapshot.plan);
 
   const viewKey = `${state.view}|${state.family}`;
   const viewChanged = state.lastViewKey !== viewKey;
@@ -554,6 +597,86 @@ function renderCleanup() {
   updateCleanupSelected();
 }
 
+function renderUsageModal(usage, plan) {
+  if (!usage || !usage.models) return;
+  const total = usage.total || {};
+  $("usage-sub").textContent = `统计 ${usage.sessions} 个会话 · ${usage.since} · 每 10 秒刷新`;
+  $("usage-total").innerHTML = [
+    `<div class="usage-total-cell"><span>tokens 输入</span><b>${fmtTokens(total.tokens_in)}</b></div>`,
+    `<div class="usage-total-cell"><span>tokens 输出</span><b>${fmtTokens(total.tokens_out)}</b></div>`,
+    `<div class="usage-total-cell"><span>请求数</span><b>${fmtTokens(total.requests)}</b></div>`,
+    `<div class="usage-total-cell"><span>成本</span><b>${fmtCost(total.cost)}</b></div>`,
+  ].join("");
+  const rows = usage.models
+    .map(
+      (m) => `
+      <div class="usage-row">
+        <span class="usage-provider">${esc(m.provider || "—")}</span>
+        <span class="usage-model">${esc(m.model)}</span>
+        <span class="usage-num">${fmtTokens(m.tokens_in)}</span>
+        <span class="usage-num">${fmtTokens(m.tokens_out)}</span>
+        <span class="usage-num">${m.requests}</span>
+        <span class="usage-num usage-cost">${fmtCost(m.cost)}</span>
+      </div>
+    `
+    )
+    .join("");
+  // 套餐余量区块
+  let planHtml = "";
+  const providers = (plan && plan.providers) || [];
+  if (providers.length) {
+    const planRows = providers
+      .map(
+        (p) =>
+          (p.windows || [])
+            .map(
+              (w) => `
+              <div class="usage-plan-row">
+                <span class="usage-provider">${esc(p.provider)}</span>
+                <span class="usage-plan-window">${esc(w.window_label)}</span>
+                <span class="usage-plan-bar">${planBar(w.used_fraction)}</span>
+                <span class="usage-plan-status ${esc(w.status)}">${planStatusText(w.status)}</span>
+              </div>
+            `
+            )
+            .join("")
+      )
+      .join("");
+    planHtml =
+      `<div class="usage-plan-head">套餐余量 · 各供应商窗口用度</div>` +
+      `<div class="usage-plan-body">${planRows}</div>`;
+  }
+  $("usage-body").innerHTML =
+    `<div class="usage-row usage-head"><span>供应商</span><span>模型</span><span>输入</span><span>输出</span><span>请求</span><span>成本</span></div>` +
+    (rows || `<div class="cleanup-empty">今日暂无用量数据</div>`) +
+    planHtml;
+}
+
+function planBar(fraction) {
+  const frac = Math.max(0, Math.min(1, Number(fraction || 0)));
+  const pct = Math.round(frac * 100);
+  return `<span class="bar"><i style="width:${pct}%"></i></span><b>${pct}%</b>`;
+}
+
+function planStatusText(status) {
+  return { ok: "正常", warning: "接近上限", exhausted: "已耗尽" }[status] || status || "—";
+}
+
+function openUsage() {
+  const dialog = $("usage");
+  dialog.hidden = false;
+  renderUsageModal(state.snapshot?.usage, state.snapshot?.plan);
+  dialog.querySelector(".usage-dialog").focus();
+}
+
+function closeUsage() {
+  const dialog = $("usage");
+  if (dialog.hidden) return;
+  dialog.hidden = true;
+  const openBtn = $("usage-open");
+  if (openBtn) openBtn.focus();
+}
+
 function setAllCleanup(checked) {
   $("cleanup-body").querySelectorAll("input[type=checkbox]").forEach((box) => {
     box.checked = checked;
@@ -750,6 +873,14 @@ $("cleanup-cancel").addEventListener("click", closeCleanup);
 $("cleanup-apply").addEventListener("click", applyCleanup);
 $("cleanup-all").addEventListener("click", () => setAllCleanup(true));
 $("cleanup-none").addEventListener("click", () => setAllCleanup(false));
+
+/* ---------- 模型用量：事件 ---------- */
+$("usage-open").addEventListener("click", openUsage);
+$("usage-close").addEventListener("click", closeUsage);
+$("usage-cancel").addEventListener("click", closeUsage);
+$("usage").addEventListener("click", (event) => {
+  if (event.target === $("usage")) closeUsage();
+});
 $("cleanup").addEventListener("click", (event) => {
   // 点击遮罩（面板外）关闭
   if (event.target === $("cleanup")) closeCleanup();
@@ -767,6 +898,11 @@ $("cleanup-threshold").addEventListener("change", async (event) => {
 });
 document.addEventListener("keydown", (event) => {
   // Esc：关闭面板（先于其它 Esc 消费方判断，面板打开时优先）
+  if (event.key === "Escape" && !$("usage").hidden) {
+    event.preventDefault();
+    closeUsage();
+    return;
+  }
   if (event.key === "Escape" && !$("cleanup").hidden) {
     event.preventDefault();
     closeCleanup();

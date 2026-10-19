@@ -21,6 +21,8 @@
   --violet: #7558cc;
   --violet-soft: rgba(117, 88, 204, 0.10);
   --cyan: #0e8ab8;
+  --slot-s: 58%;
+  --slot-l: 42%;
   --shell-glow: rgba(63, 110, 230, 0.09);
   --shadow-card: 0 1px 2px rgba(20, 24, 31, 0.05), 0 6px 18px rgba(20, 24, 31, 0.06);
   --radius: 12px;
@@ -357,6 +359,10 @@ h1 { margin: 0; font-size: 18px; line-height: 1.2; font-weight: 650; letter-spac
 .card.tone-settled { --card-tone: var(--green); }
 .card.tone-window { --card-tone: var(--violet); }
 .card.tone-unknown { --card-tone: var(--text-3); }
+.card[data-slot] {
+  /* 会话标签色：按 pane 固定分配，会话存活期间不变；状态色仍由 pill / 状态图标表达 */
+  --card-tone: hsl(var(--slot-h, 200) var(--slot-s, 60%) var(--slot-l, 55%));
+}
 .card:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--card-tone) 35%, var(--border-strong)); background: var(--surface-hover); }
 .card:focus-visible { outline: 2px solid var(--card-tone); outline-offset: -2px; border-color: var(--card-tone); }
 .card.focused { border-color: color-mix(in srgb, var(--card-tone) 60%, var(--border-strong)); }
@@ -414,12 +420,15 @@ h1 { margin: 0; font-size: 18px; line-height: 1.2; font-weight: 650; letter-spac
 }
 .card-corner svg { width: 11px; height: 11px; color: var(--card-tone); opacity: .7; }
 .card-corner-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-provider { color: var(--text-3); font-weight: 600; margin-left: 3px; }
+.card-model { color: var(--card-tone); font-weight: 600; margin-left: 3px; }
+.card-sub { color: color-mix(in srgb, var(--card-tone) 70%, var(--text-2)); font-weight: 600; margin-left: 3px; }
 .card-pill {
   padding: 3px 8px;
-  border: 1px solid color-mix(in srgb, var(--card-tone) 40%, var(--border-strong));
+  border: 1px solid color-mix(in srgb, var(--tone) 40%, var(--border-strong));
   border-radius: 999px;
-  color: var(--card-tone);
-  background: color-mix(in srgb, var(--card-tone) 9%, transparent);
+  color: var(--tone);
+  background: color-mix(in srgb, var(--tone) 9%, transparent);
   font-family: var(--mono);
   font-size: 10px;
   font-weight: 650;
@@ -463,7 +472,7 @@ h1 { margin: 0; font-size: 18px; line-height: 1.2; font-weight: 650; letter-spac
   white-space: nowrap;
 }
 .card-meta { display: flex; align-items: center; gap: 7px; margin-top: 12px; color: var(--text-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card-meta-icon { display: inline-flex; color: var(--card-tone); }
+.card-meta-icon { display: inline-flex; color: var(--tone); }
 .card-meta-icon svg { width: 12px; height: 12px; }
 .card-meta-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .card-meta-text strong { color: var(--text-2); font-weight: 600; }
@@ -748,6 +757,108 @@ kbd { padding: 2px 6px; border: 1px solid var(--border-strong); border-radius: 4
 .toast[hidden] { display: none; }
 .toast.toast-out { opacity: 0; }
 
+/* ---------- 模型用量面板 ---------- */
+.topbar-usage {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 3px 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-2);
+}
+.topbar-usage:hover .ts-value { color: var(--cyan); }
+.topbar-usage .ts-value { color: var(--green); }
+.usage-backdrop { z-index: 151; }
+.usage-dialog { width: min(760px, 100%); }
+.usage-total {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.usage-total-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+}
+.usage-total-cell span { color: var(--text-3); font-size: 10.5px; font-family: var(--mono); letter-spacing: .05em; }
+.usage-total-cell b { color: var(--text); font-family: var(--mono); font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.usage-body { padding: 8px 18px 4px; }
+.usage-row {
+  display: grid;
+  grid-template-columns: 0.9fr minmax(0, 1.8fr) repeat(4, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.usage-row.usage-head {
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .06em;
+  border-bottom: 1px solid var(--border-strong);
+}
+.usage-provider { color: var(--cyan); font-family: var(--mono); font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-model { color: var(--text); font-family: var(--mono); font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-fam { color: var(--text-3); font-size: 10.5px; font-family: var(--mono); }
+.usage-num { color: var(--text-2); font-family: var(--mono); font-size: 11.5px; font-variant-numeric: tabular-nums; text-align: right; }
+.usage-cost { color: var(--green); font-weight: 650; }
+
+/* 套餐余量区块 */
+.usage-plan-head {
+  margin-top: 16px;
+  padding: 8px 10px 4px;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 650;
+  font-family: var(--mono);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.usage-plan-row {
+  display: grid;
+  grid-template-columns: 0.9fr 0.6fr minmax(0, 2fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-2);
+  font-size: 12px;
+}
+.usage-plan-window { color: var(--text-3); font-family: var(--mono); font-size: 11px; }
+.usage-plan-row .bar {
+  display: inline-block;
+  width: 100%;
+  height: 7px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.usage-plan-row .bar i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--green);
+}
+.usage-plan-row .bar i.warn { background: var(--amber); }
+.usage-plan-row .bar i.exhausted { background: var(--rose); }
+.usage-plan-row b { font-family: var(--mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+.usage-plan-status { font-family: var(--mono); font-size: 10.5px; white-space: nowrap; }
+.usage-plan-status.ok { color: var(--green); }
+.usage-plan-status.warning { color: var(--amber); }
+.usage-plan-status.exhausted { color: var(--rose); }
+body[data-theme="command"] .topbar-usage .ts-value { color: var(--cyan); }
+
 /* ---------- 品牌开场动画 ---------- */
 .intro {
   position: fixed;
@@ -825,6 +936,8 @@ body[data-theme="dark"] {
   --violet: #ae8cff;
   --violet-soft: rgba(174, 140, 255, 0.11);
   --cyan: #22d3ee;
+  --slot-s: 64%;
+  --slot-l: 62%;
   --shell-glow: rgba(102, 152, 255, 0.11);
   --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.02), 0 8px 24px rgba(0, 0, 0, 0.22);
 }
@@ -843,6 +956,8 @@ body[data-theme="neon"] {
   --border-strong: #223042;
   --text: #e8f1fb;
   --text-2: #9fb4cc;
+  --slot-s: 64%;
+  --slot-l: 62%;
   --text-3: #5c6f88;
   --blue: #3f8cff;
   --blue-soft: rgba(63, 140, 255, 0.16);
@@ -912,9 +1027,9 @@ body[data-theme="neon"] .card-corner {
 }
 body[data-theme="neon"] .card-corner svg { color: var(--card-tone); opacity: .75; }
 body[data-theme="neon"] .card-pill {
-  border-color: color-mix(in srgb, var(--card-tone) 42%, transparent);
+  border-color: color-mix(in srgb, var(--tone) 42%, transparent);
   background: transparent;
-  text-shadow: 0 0 10px color-mix(in srgb, var(--card-tone) 60%, transparent);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--tone) 60%, transparent);
 }
 body[data-theme="neon"] textarea { background: #0c121a; border-color: #223042; }
 body[data-theme="neon"] .composer-output { background: #0a0f16; }
@@ -945,6 +1060,8 @@ body[data-theme="command"] {
   --violet: #8b9bff;
   --violet-soft: rgba(139, 155, 255, 0.13);
   --cyan: #22d3ee;
+  --slot-s: 64%;
+  --slot-l: 62%;
   --shadow-card: 0 0 0 1px rgba(82, 182, 255, 0.04), 0 12px 34px rgba(0, 0, 0, 0.55);
 }
 body[data-theme="command"] .app-shell {
@@ -1037,9 +1154,9 @@ body[data-theme="command"] .card-corner {
 }
 body[data-theme="command"] .card-corner svg { color: var(--card-tone); opacity: .75; }
 body[data-theme="command"] .card-pill {
-  border-color: color-mix(in srgb, var(--card-tone) 38%, transparent);
-  background: color-mix(in srgb, var(--card-tone) 8%, transparent);
-  text-shadow: 0 0 10px color-mix(in srgb, var(--card-tone) 60%, transparent);
+  border-color: color-mix(in srgb, var(--tone) 38%, transparent);
+  background: color-mix(in srgb, var(--tone) 8%, transparent);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--tone) 60%, transparent);
 }
 body[data-theme="command"] .card-desc { color: var(--text-2); }
 body[data-theme="command"] .card-meta { color: var(--text-3); }
