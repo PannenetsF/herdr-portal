@@ -593,7 +593,12 @@ def normalize_item(
         meta = AGENT_META.get(agent, {"label": str(agent).upper(), "family": "other"})
         agent_label = meta["label"]
         family = meta["family"]
-        column = status if status in STATUS_META else "unknown"
+        # pf fork: unknown (agent process recognized but no lifecycle status
+        # reported yet — common when several agents start in one tab) has a
+        # status label and tone of its own, but upstream gives it no column
+        # bucket, so those cards silently drop off the board. File them under
+        # 执行中 until the agent reports in; the card still reads 未知.
+        column = "working" if status == "unknown" else (status if status in STATUS_META else "unknown")
         status_label = STATUS_META.get(status, STATUS_META["unknown"])["label"]
 
     pane_title = str(pane.get("label") or "").strip()
@@ -1310,6 +1315,10 @@ def _reclaim_verdict(
     if item.get("kind") == "agent":
         if item.get("status") in {"working", "blocked"}:
             return "protected", "", "Agent 运行中", process_label
+        if item.get("status") == "unknown":
+            # 状态尚未上报不等于空闲：此时回收可能杀掉刚启动的 agent
+            # （pf fork：与看板把 unknown 并入执行中列保持一致）。
+            return "protected", "", "Agent 状态未知", process_label
         if item.get("background_running"):
             # 主 agent 空闲但子代理还在跑，关掉 pane 会连着后台一起杀。
             return "protected", "", "后台子代理运行中", process_label
