@@ -32,6 +32,19 @@ STATUS_META = {
     "unknown": {"label": "未知", "short": "UNKNOWN", "tone": "unknown"},
 }
 
+# pf fork: herdr-projects 0.2.x（projects+threads 模型的常驻 ticker）把需要
+# 人介入的 thread 分进这两组，并由 ticker 发 request/done 提示音。herdr 原生
+# agent_status 完全不携带这层语义（review 中的 pane 多半是 idle，甚至已关闭），
+# 所以看板单独从 0.2 的 `thread list --json` 汇合进「待处理」列。
+LEGACY_ATTENTION_GROUPS = ("waiting-on-you", "ready-for-review")
+LEGACY_GROUP_LABELS = {
+    "waiting-on-you": "待你处理",
+    "ready-for-review": "待评审",
+}
+LEGACY_TTL = 7.0  # thread list 每 project 一次 herdr 调用，比 pane 快照重，7s 复用
+_legacy_lock = threading.Lock()
+_legacy_cache: tuple[float, dict[str, Any] | None] | None = None
+
 AGENT_META = {
     "pi": {"label": "PI", "family": "pi"},
     "omp": {"label": "OMP", "family": "omp"},
@@ -837,6 +850,9 @@ def _fingerprint(snapshot: dict[str, Any]) -> str:
             "tokens_out": item.get("tokens_out"),
             "revision": item.get("revision"),
             "color_slot": item.get("color_slot"),
+            "legacy_project": item.get("legacy_project"),
+            "legacy_thread": item.get("legacy_thread"),
+            "legacy_group": item.get("legacy_group"),
         }
         for item in snapshot.get("items") or []
     ]
@@ -886,7 +902,55 @@ def collect() -> dict[str, Any]:
             item["quiet_seconds"] = int(max(0.0, now - since)) if since else 0
             item["quiet_label"] = human_age(since, now)
     assign_color_slots(items, now)
+    # ── legacy herdr-projects 0.2 thread 汇合 ──
+    legacy_data = _legacy_for_collect()
+    if legacy_data:
+        pane_index: dict[str, dict[str, Any]] = {item["pane_id"]: item for item in items}
+        attention: list[dict[str, Any]] = []
+        for slug, threads in legacy_data.items():
+            for t in threads:
+                group = t.get("group_token") or ""
+                if group not in LEGACY_ATTENTION_GROUPS:
+                    continue
+                pid = t.get("pane_id") or ""
+                live = pane_index.get(pid)
+                label = LEGACY_GROUP_LABELS.get(group, group)
+                if live and live.get("kind") == "agent":
+                    live["column"] = "attention"
+                    live["legacy_project"] = slug
+                    live["legacy_thread"] = t.get("id", "")
+                    live["legacy_group"] = group
+                    if group == "waiting-on-you":
+                        attention.append(live)
+                if live is None or not pid:
+                    virtual = build_virtual_item(
+                        pane_id=f"legacy:{slug}:{t.get('id', '')}",
+                        title=t.get("title") or t.get("id", ""),
+                        status_label=label,
+                        column="attention",
+                        kind="legacy",
+                        workspace_id=t.get("workspace_id") or "",
+                        workspace=t.get("workspace_id") or (slug[:12]),
+                        tab_id=t.get("tab_id") or "",
+                        tab="past pane",
+                        family="legacy",
+                        agent_label=label,
+                        legacy_project=slug,
+                        legacy_thread=t.get("id", ""),
+                        legacy_group=group,
+                    )
+                    attention.append(virtual)
+        # waiting-on-you 先于 ready-for-review（已从 legacy_data 遍历来，
+        # 每个项目按 group 天然有序；显式按 group 重排保证）
+        attention.sort(key=lambda i: 0 if i.get("legacy_group") == "waiting-on-you" else 1)
+        if attention:
+            # 把已标记 attention 的活卡从原列拔出
+            attention_ids = {i["pane_id"] for i in attention}
+            items = [i for i in items if i["pane_id"] not in attention_ids]
+            items = attention + items
+    # ── / legacy ──
     counts = {
+        "attention": 0,
         "blocked": 0,
         "working": 0,
         "idle": 0,
@@ -900,13 +964,16 @@ def collect() -> dict[str, Any]:
     for item in items:
         if item["kind"] == "window":
             counts["windows"] += 1
-        else:
+        elif item["kind"] != "legacy":
             counts["agents"] += 1
             if item.get("background_running"):
                 counts["background"] += 1
-            elif item["status"] in counts:
-                counts[item["status"]] += 1
+        if item["column"] == "attention":
+            counts["attention"] += 1
+        elif item["status"] in counts:
+            counts[item["status"]] += 1
     columns = {
+        "attention": [item for item in items if item["column"] == "attention"],
         "blocked": [item for item in items if item["column"] == "blocked"],
         "working": [item for item in items if item["column"] == "working"],
         "settled": [item for item in items if item["column"] in {"idle", "done"}],
@@ -994,6 +1061,7 @@ def _collect_once() -> dict[str, Any]:
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "clock": time.strftime("%H:%M:%S"),
             "counts": {
+                "attention": 0,
                 "blocked": 0,
                 "working": 0,
                 "idle": 0,
@@ -1004,7 +1072,7 @@ def _collect_once() -> dict[str, Any]:
                 "total": 0,
             },
             "items": [],
-            "columns": {"blocked": [], "working": [], "settled": [], "window": []},
+            "columns": {"attention": [], "blocked": [], "working": [], "settled": [], "window": []},
             "spaces": [],
             "focused": {},
         }
@@ -1156,7 +1224,21 @@ def focus_target(pane_id: str) -> dict[str, Any]:
     item = next((entry for entry in snapshot["items"] if entry["pane_id"] == pane_id), None)
     if not item:
         raise RuntimeError(f"pane not found: {pane_id}")
-    if item["kind"] == "agent":
+    if item["kind"] in {"agent", "legacy"}:
+        if item["kind"] == "legacy":
+            slug = item.get("legacy_project") or ""
+            tid = item.get("legacy_thread") or ""
+            if not slug or not tid:
+                raise RuntimeError(f"legacy item missing project/thread: {pane_id}")
+            restarted = legacy_restart(slug, tid)
+            if not restarted:
+                raise RuntimeError(f"thread restart 失败 · {slug}/{tid}")
+            new_pid = restarted.get("pane_id")
+            if not new_pid:
+                raise RuntimeError(f"thread restart 出但无 pane_id · {slug}/{tid}")
+            target_result = run_herdr("agent", "focus", new_pid)
+            bring_herdr_to_front()
+            return target_result
         result = run_herdr("agent", "focus", pane_id)
         bring_herdr_to_front()
         return result
@@ -1174,6 +1256,235 @@ def focus_target(pane_id: str) -> dict[str, Any]:
     result = run_herdr("pane", "zoom", pane_id, "--off")
     bring_herdr_to_front()
     return result
+
+
+# ── legacy herdr-projects 0.2.x 线程数据 ──────────────────────────────
+
+
+def _legacy_hp_bin() -> str | None:
+    """探 `herdr-projects` 0.2.x binary：先 PATH，再本地编译产物。"""
+    env = os.environ.get("HERDR_PROJECTS_LEGACY_BIN")
+    if env:
+        bin_path = Path(env).expanduser()
+        if bin_path.is_file() and os.access(bin_path, os.X_OK):
+            return str(bin_path)
+        return None
+    # PATH probe（只认输出以 "herdr-projects 0.2." 开头）
+    which = shutil.which("herdr-projects")
+    if which:
+        try:
+            raw = subprocess.run(
+                [which, "--version"],
+                check=False, capture_output=True, text=True, timeout=2,
+            ).stdout
+            if raw.startswith("herdr-projects 0.2."):
+                return which
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Glob 编译产物: plugins/github/herdr-projects-*/target/release/
+    # 和 github-installations/*/checkout/target/release/
+    home = Path.home()
+    for pattern in (
+        ".config/herdr/plugins/github/herdr-projects-*/target/release/herdr-projects",
+        ".config/herdr/plugins/github-installations/herdr-projects-*/*/checkout/target/release/herdr-projects",
+    ):
+        for candidate in sorted(home.glob(pattern)):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                try:
+                    raw = subprocess.run(
+                        [str(candidate), "--version"],
+                        check=False, capture_output=True, text=True, timeout=2,
+                    ).stdout
+                    if raw.startswith("herdr-projects 0.2."):
+                        return str(candidate)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+    return None
+
+
+def _legacy_root() -> Path | None:
+    """herdr-projects 0.2 项目根；默认 ~/.herdr-projects，备选 ~/.herdr-projects-legacy。"""
+    env = os.environ.get("HERDR_PROJECTS_LEGACY_ROOT")
+    if env:
+        candidate = Path(env).expanduser()
+        return candidate if candidate.is_dir() else None
+    for dft in (Path.home() / ".herdr-projects", Path.home() / ".herdr-projects-legacy"):
+        if dft.is_dir():
+            return dft
+    return None
+
+
+def _project_slugs(root: Path) -> list[str]:
+    """根下每个含 PROJECT.md 的子目录为一个 project（旧 `list` 无 --json）。"""
+    try:
+        entries = sorted(entry.name for entry in root.iterdir() if entry.is_dir())
+    except OSError:
+        return []
+    return [n for n in entries if (root / n / "PROJECT.md").is_file()]
+
+
+def _threads_json(bin_path: str, root: Path, slug: str) -> list[dict[str, Any]]:
+    """`herdr-projects --root <root> thread list <slug> --json` → 线程列表。"""
+    completed = subprocess.run(
+        [bin_path, "--root", str(root), "thread", "list", slug, "--json"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=4.0,
+    )
+    raw = completed.stdout.strip()
+    if not raw and completed.stderr:
+        raw = completed.stderr.strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        note(f"thread list JSON 解析失败 · {slug}", None)
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def _legacy_source() -> dict[str, list[dict[str, Any]]] | None:
+    """返回 { "&lt;slug&gt;": [threads…] }，失败/不可用时为 None。"""
+    bin_path = _legacy_hp_bin()
+    if not bin_path:
+        return None
+    root = _legacy_root()
+    if not root:
+        return None
+    slugs = _project_slugs(root)
+    if not slugs:
+        return None
+    results: dict[str, list[dict[str, Any]]] = {}
+
+    def _fetch(slug: str) -> tuple[str, list[dict[str, Any]]]:
+        return slug, _threads_json(bin_path, root, slug)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(slugs))) as pool:
+        for slug, threads in pool.map(_fetch, slugs):
+            if threads:
+                results[slug] = threads
+    return results if results else None
+
+
+def _legacy_for_collect() -> dict[str, list[dict[str, Any]]]:
+    """带 TTL 缓存的 legacy 线程数据：失败返回 {}。"""
+    global _legacy_cache
+    now = time.time()
+    with _legacy_lock:
+        if _legacy_cache is not None and now - _legacy_cache[0] < LEGACY_TTL:
+            return _legacy_cache[1] or {}
+        result = _optional("herdr-projects 线程数据采集失败", _legacy_source) or {}
+        _legacy_cache = (now, result)
+    return result or {}
+
+
+def build_virtual_item(
+    pane_id: str,
+    title: str,
+    status_label: str,
+    column: str,
+    kind: str,
+    *,
+    workspace_id: str = "",
+    workspace: str = "",
+    tab_id: str = "",
+    tab: str = "",
+    family: str = "",
+    agent_label: str = "",
+    legacy_project: str = "",
+    legacy_thread: str = "",
+    legacy_group: str = "",
+) -> dict[str, Any]:
+    """构建一个 45-key 虚拟卡片（与 normalize_item 同构）。"""
+    return {
+        "id": pane_id,
+        "kind": kind,
+        "agent": family or kind,
+        "agent_label": agent_label or status_label,
+        "family": family or kind,
+        "status": kind,
+        "status_label": status_label,
+        "column": column,
+        "workspace_id": workspace_id,
+        "workspace": workspace or "—",
+        "tab_id": tab_id,
+        "tab": tab or "—",
+        "pane_id": pane_id,
+        "pane_label": title,
+        "pane_title": title,
+        "session_title": "",
+        "terminal_title": "",
+        "title": title,
+        "secondary_title": f"{legacy_project} · {legacy_thread}",
+        "activity_phase": LEGACY_GROUP_LABELS.get(legacy_group, legacy_group),
+        "activity_title": status_label,
+        "activity_tool": legacy_project,
+        "activity_active": False,
+        "activity_tone": column,
+        "cwd": "",
+        "cwd_short": "",
+        "project": legacy_project,
+        "focused": False,
+        "session_id": f"{legacy_project}-{legacy_thread}",
+        "session_path": "",
+        "last_active": None,
+        "last_active_label": "",
+        "preview": "",
+        "last_output": "",
+        "last_output_at": None,
+        "last_output_label": "",
+        "terminal_title_raw": "",
+        "model": "",
+        "provider": "",
+        "subagent_total": 0,
+        "subagent_running": 0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "revision": None,
+        "background_running": 0,
+        "legacy_project": legacy_project,
+        "legacy_thread": legacy_thread,
+        "legacy_group": legacy_group,
+    }
+
+
+_hp_bin_memo: str | None = None
+
+
+def legacy_restart(slug: str, thread_id: str) -> dict[str, Any] | None:
+    """`herdr-projects 0.2 thread restart <slug> <id>` — 找 pane，启动回来。"""
+    global _hp_bin_memo
+    if not _hp_bin_memo:
+        _hp_bin_memo = _legacy_hp_bin()
+    bin_path = _hp_bin_memo
+    if not bin_path:
+        raise RuntimeError("找不到 herdr-projects 0.2.x 二进制")
+    root = _legacy_root()
+    if not root:
+        raise RuntimeError("找不到 herdr-projects 项目根目录")
+    _threads_json(bin_path, root, slug)  # 确保 stale cache 更新
+    completed = subprocess.run(
+        [bin_path, "--root", str(root), "thread", "restart", slug, thread_id],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+    )
+    stdout_text = completed.stdout.strip() or completed.stderr.strip() or ""
+    note(f"thread restart {slug}/{thread_id}", stdout_text[:300])
+    # CLI 打印人话 "t-id is back in pane wX:pY"；restart 后重新 collect
+    # 按 thread pane_id 定位
+    threads = _threads_json(bin_path, root, slug)
+    for t in threads:
+        if t.get("id") == thread_id and t.get("pane_id"):
+            # 清缓存让下次 collect 拿到最新快照
+            global _collect_state
+            with _collect_gate:
+                _collect_state = None
+            return {"pane_id": t["pane_id"], "title": t.get("title", ""), "project": slug}
+    return None
 
 
 def _state_dir() -> Path:
@@ -1308,8 +1619,8 @@ def _reclaim_verdict(
     _, process_label, shell_only = _foreground_summary(info)
     if item.get("focused") or item.get("pane_id") == focused_pane_id:
         return "protected", "", "当前聚焦", process_label
-    if info is None:
-        return "protected", "", "进程信息不可用", process_label
+    if item.get("kind") in {"legacy", "window"} and item.get("kind") != "agent":
+        return "protected", "", "外部数据 · 非实体会话", process_label
     if _is_portal_pane(info):
         return "protected", "", "看板自身", process_label
     if item.get("kind") == "agent":

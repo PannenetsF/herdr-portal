@@ -55,7 +55,9 @@ class UnknownColumnTest(unittest.TestCase):
             "panes": [agent_pane("wD:p1"), agent_pane("wD:p2")],
         }
         payload = {"result": {"snapshot": snapshot}}
-        with mock.patch.object(collect, "run_herdr", return_value=payload):
+        with mock.patch.object(collect, "run_herdr", return_value=payload), \
+             mock.patch.object(collect, "_legacy_hp_bin", return_value=None):
+            collect._legacy_cache = None
             result = collect.collect_or_error(ttl=0)
         self.assertEqual([i["pane_id"] for i in result["columns"]["working"]], ["wD:p1", "wD:p2"])
         self.assertEqual(result["counts"]["unknown"], 2)

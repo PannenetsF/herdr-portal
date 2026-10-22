@@ -2,6 +2,7 @@ const SVG_ATTRS =
   'fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
 
 const ICONS = {
+  attention: `<svg viewBox="0 0 24 24" ${SVG_ATTRS}><circle cx="12" cy="12" r="10"/><path d="M12 6v7"/><path d="M12 18v.01"/></svg>`,
   blocked: `<svg viewBox="0 0 24 24" ${SVG_ATTRS}><path d="M12 3 2.5 20h19z"/><path d="M12 9v5"/><path d="M12 17.5v.01"/></svg>`,
   working: `<svg viewBox="0 0 24 24" ${SVG_ATTRS}><path d="M3 12h4l2-6 4 12 2-6h6"/></svg>`,
   settled: `<svg viewBox="0 0 24 24" ${SVG_ATTRS}><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg>`,
@@ -11,6 +12,7 @@ const ICONS = {
 };
 
 const COLUMNS = [
+  ["attention", "待处理", "ATTENTION", ICONS.attention, "需要你处理 / 待评审"],
   ["blocked", "待确认", "BLOCKED", ICONS.blocked, "等待你确认 / 输入"],
   ["working", "执行中", "WORKING", ICONS.working, "正在跑"],
   ["settled", "已就绪", "SETTLED", ICONS.settled, "空闲 / 完成"],
@@ -100,6 +102,7 @@ function families(items) {
 }
 
 function statusIcon(tone) {
+  if (tone === "attention") return ICONS.attention;
   if (tone === "blocked") return ICONS.blocked;
   if (tone === "working") return ICONS.working;
   if (tone === "settled") return ICONS.settled;
@@ -109,11 +112,14 @@ function statusIcon(tone) {
 function card(item) {
   const selected = state.selected && state.selected.pane_id === item.pane_id;
   const isAgent = item.kind === "agent";
-  const replyBtn = isAgent
+  const isLegacy = item.kind === "legacy";
+  const replyBtn = isAgent && !isLegacy
     ? `<button class="card-reply" data-reply="${esc(item.pane_id)}" title="回复该 Agent" aria-label="回复该 Agent">${ICONS.reply}</button>`
     : "";
   // 主 agent 空闲但子代理还在跑：视觉上按「执行中」处理，别让人误读成收工
-  const tone = !isAgent
+  const tone = item.column === "attention"
+    ? "attention"
+    : !isAgent
     ? "window"
     : item.background_running
       ? "working"
@@ -240,9 +246,13 @@ function renderBoard(snapshot) {
   const columns = snapshot.columns || {};
   const blockedItems = (columns.blocked || []).filter(matches);
   const showBlocked = blockedItems.length > 0;
-  const visibleColumns = showBlocked
-    ? COLUMNS
-    : COLUMNS.filter(([key]) => key !== "blocked");
+  const attentionItems = (columns.attention || []).filter(matches);
+  const showAttention = attentionItems.length > 0;
+  const visibleColumns = COLUMNS.filter(([key]) => {
+    if (key === "blocked" && !showBlocked) return false;
+    if (key === "attention" && !showAttention) return false;
+    return true;
+  });
   const appear = showBlocked && !(state.lastBlockedCount > 0) ? "col-in" : "";
   state.lastBlockedCount = blockedItems.length;
 
@@ -870,8 +880,26 @@ document.querySelector(".modes").addEventListener("click", (event) => {
 });
 
 function activateCard(paneId) {
+  const item = findItem(paneId);
+  if (item && item.kind === "legacy") {
+    legacyRestart(paneId);
+    return;
+  }
   selectPane(paneId);
   focusPane(paneId);
+}
+
+async function legacyRestart(paneId) {
+  try {
+    const resp = await apiFetch("/api/legacy-restart", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pane_id: paneId }),
+    });
+    if (resp.ok) load(); else showToast("restart 失败");
+  } catch (err) {
+    showToast("网络错误");
+  }
 }
 
 $("stage").addEventListener("click", (event) => {

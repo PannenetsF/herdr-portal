@@ -52,6 +52,7 @@ from collect import (  # noqa: E402
 import logutil  # noqa: E402 - 同目录模块（board/ 已在 sys.path 上）
 
 AGENT_COLUMNS = (
+    ("attention", "ATTENTION", "待处理", "需要你处理 / 待评审"),
     ("blocked", "ACTION", "待确认", "等待你确认 / 输入"),
     ("working", "RUNNING", "执行中", "正在运行"),
     ("settled", "SETTLED", "已就绪", "空闲 / 完成"),
@@ -88,43 +89,49 @@ CARD_HEIGHT = 5
 CARD_GAP = 1
 
 # Color-pair IDs.
-P_BLOCKED = 1
-P_WORKING = 2
-P_SETTLED = 3
-P_WINDOW = 4
-P_TEXT = 5
-P_ACCENT = 6
-P_MUTED = 7
-P_BORDER = 8
-P_BG = 9
-P_CARD = 10
-P_CARD_MUTED = 11
-P_SELECT_BLOCKED = 12
-P_SELECT_WORKING = 13
-P_SELECT_SETTLED = 14
-P_SELECT_WINDOW = 15
-P_CARD_BLOCKED = 16
-P_CARD_WORKING = 17
-P_CARD_SETTLED = 18
-P_CARD_WINDOW = 19
-P_DETAIL = 20
-P_LIVE = 21
-P_SELECT_ACCENT = 22
+P_ATTENTION = 1
+P_BLOCKED = 2
+P_WORKING = 3
+P_SETTLED = 4
+P_WINDOW = 5
+P_TEXT = 6
+P_ACCENT = 7
+P_MUTED = 8
+P_BORDER = 9
+P_BG = 10
+P_CARD = 11
+P_CARD_MUTED = 12
+P_SELECT_ATTENTION = 13
+P_SELECT_BLOCKED = 14
+P_SELECT_WORKING = 15
+P_SELECT_SETTLED = 16
+P_SELECT_WINDOW = 17
+P_CARD_ATTENTION = 18
+P_CARD_BLOCKED = 19
+P_CARD_WORKING = 20
+P_CARD_SETTLED = 21
+P_CARD_WINDOW = 22
+P_DETAIL = 23
+P_LIVE = 24
+P_SELECT_ACCENT = 25
 P_SLOT_BASE = 30  # P_SLOT_BASE + slot → 会话标签色对（前景=槽位色，背景=卡片底）
 
 COLUMN_PAIR = {
+    "attention": P_ATTENTION,
     "blocked": P_BLOCKED,
     "working": P_WORKING,
     "settled": P_SETTLED,
     "window": P_WINDOW,
 }
 SELECT_PAIR = {
+    "attention": P_SELECT_ATTENTION,
     "blocked": P_SELECT_BLOCKED,
     "working": P_SELECT_WORKING,
     "settled": P_SELECT_SETTLED,
     "window": P_SELECT_WINDOW,
 }
 CARD_STATUS_PAIR = {
+    "attention": P_CARD_ATTENTION,
     "blocked": P_CARD_BLOCKED,
     "working": P_CARD_WORKING,
     "settled": P_CARD_SETTLED,
@@ -451,6 +458,8 @@ class Board:
 
     def visible_agent_keys(self) -> list[str]:
         keys: list[str] = []
+        if self.column_items("attention"):
+            keys.append("attention")
         if self.column_items("blocked"):
             keys.append("blocked")
         keys.extend(["working", "settled"])
@@ -991,6 +1000,7 @@ class Board:
         _right(self.stdscr, 2, right_edge, total_text, curses.color_pair(P_MUTED))
 
         stats = (
+            ("attention", counts.get("attention", 0), "待处理"),
             ("blocked", counts.get("blocked", 0), "待确认"),
             ("working", counts.get("working", 0), "执行中"),
             ("working", counts.get("background", 0), "后台"),
@@ -1836,6 +1846,7 @@ def _init_colors() -> None:
     rich = curses.COLORS >= 256
     bg = 235 if rich else -1
     card_bg = 237 if rich else -1
+    attention = 217 if rich else curses.COLOR_YELLOW  # 暖橙，比 blocked 红温和、比 working 黄重要
     blocked = 203 if rich else curses.COLOR_RED
     working = 221 if rich else curses.COLOR_YELLOW
     settled = 150 if rich else curses.COLOR_GREEN
@@ -1847,6 +1858,7 @@ def _init_colors() -> None:
     dark = 235 if rich else curses.COLOR_BLACK
 
     pairs = {
+        P_ATTENTION: (attention, bg),
         P_BLOCKED: (blocked, bg),
         P_WORKING: (working, bg),
         P_SETTLED: (settled, bg),
@@ -1858,10 +1870,12 @@ def _init_colors() -> None:
         P_BG: (text, bg),
         P_CARD: (text, card_bg),
         P_CARD_MUTED: (muted, card_bg),
+        P_SELECT_ATTENTION: (dark, attention),
         P_SELECT_BLOCKED: (dark, blocked),
         P_SELECT_WORKING: (dark, working),
         P_SELECT_SETTLED: (dark, settled),
         P_SELECT_WINDOW: (dark, window),
+        P_CARD_ATTENTION: (attention, card_bg),
         P_CARD_BLOCKED: (blocked, card_bg),
         P_CARD_WORKING: (working, card_bg),
         P_CARD_SETTLED: (settled, card_bg),
@@ -2061,7 +2075,7 @@ def run_board(stdscr: curses.window, board: Board) -> None:
             board.move(drow=-1)
         elif key in (curses.KEY_DOWN, "j"):
             board.move(drow=1)
-        elif key in ("1", "2", "3", "4"):
+        elif key in ("1", "2", "3", "4", "5"):
             board.choose_column(int(key) - 1)
         elif key == curses.KEY_MOUSE:
             try:

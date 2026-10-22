@@ -27,6 +27,7 @@ from collect import (  # noqa: E402
     cleanup_scan,
     collect_or_error,
     focus_target,
+    legacy_restart,
     send_text,
 )
 
@@ -214,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/focus", "/api/send", "/api/cleanup"}:
+        if parsed.path not in {"/api/focus", "/api/send", "/api/cleanup", "/api/legacy-restart"}:
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         if not self._guard_api(mutating=True):
@@ -246,6 +247,14 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(text, list):
                     text = text[0]
                 result = send_text(str(pane_id or ""), str(text or ""))
+            elif parsed.path == "/api/legacy-restart":
+                slug = payload.get("slug") if isinstance(payload, dict) else None
+                thread_id = payload.get("thread_id") if isinstance(payload, dict) else None
+                # pane_id 格式 "legacy:<slug>:<id>"
+                if not slug and pane_id and pane_id.startswith("legacy:"):
+                    parts = pane_id.split(":", 2)
+                    slug, thread_id = parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else ""
+                result = legacy_restart(str(slug or ""), str(thread_id or "")) or {}
             else:
                 result = focus_target(str(pane_id or ""))
             self._json(200, {"ok": True, "result": result})
