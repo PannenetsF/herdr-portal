@@ -1,5 +1,45 @@
 # Changelog
 
+## [1.3.0-pf.2] — 2026-10-22
+
+PannenetsF fork 补丁版本，配合 herdr-projects 0.2 fork（project+threads 模型，
+永久 pin，不升级上游 1.2.x）。pf.1 与 pf.2 两条一并记录。
+
+### 新增
+
+**「待处理」列消费 0.2 thread 状态（pf.2）**
+
+- 问题：响铃全部来自旧 0.2.34 pf ticker（thread 进入 waiting-on-you /
+  ready-for-review 时调 `herdr notification show --sound`），但 portal 只读
+  herdr api snapshot 的 agent_status——待评审的 thread 被归进「空闲」，
+  pane 已死的干脆不显示，响铃后无从定位该去哪个 session。
+- 方案：`collect()` 末尾注入 legacy 0.2 数据源（枚举含 PROJECT.md 的项目目录，
+  ThreadPoolExecutor 并发跑 `herdr-projects --root <root> thread list <slug>
+  --json`，4s 超时、7s TTL，二进制经 `HERDR_PROJECTS_LEGACY_BIN` / PATH /
+  两个插件目录 glob 发现且只接受 `0.2.*`，root 默认 `~/.herdr-projects`、
+  不存在回退 `~/.herdr-projects-legacy`）。waiting-on-you / ready-for-review
+  的活 agent 打标注后移入最左「待处理」列（waiting-on-you 排前）；pane 已死
+  的生成虚拟卡（`kind="legacy"`、合成 `pane_id="legacy:<slug>:<id>"`），
+  回车 / 网页点击走新的 `/api/legacy-restart`（`thread restart` 后重新采集并
+  跳到新 pane，沿用 1.3.0 的 token / Origin 校验）。新增 `attention` 计数，
+  进 fingerprint；`cleanup_scan` 排除 legacy 虚拟卡。TUI / web 列非空时最先
+  显示，暖橙着色。
+- 验证：新增 `tests/test_legacy_threads.py` 11 个用例（合并、虚拟卡、过滤、
+  排序、骨架、cleanup 保护、restart、二进制发现与版本拒绝），全套 41 测试绿；
+  真机「待处理」列列出 ready-for-review 线程，活卡回车跳 pane、死卡回车
+  restart 后跳新 pane。
+
+### 修复
+
+**unknown 状态 agent 从主看板消失（pf.1）**
+
+- 问题：上游 1.3.0 重写状态系统后已能识别 `agent_status=unknown`（agent 进程
+  在但生命周期状态尚未上报，一个 tab 多 agent 刚启动时常见），但 collect() 的
+  columns 仍只建 blocked / working / settled / window 四个桶，这类卡从 TUI 与
+  web 主看板消失，空闲回收也把它们当候选。
+- 方案：unknown 卡并入「执行中」列（保留「未知」标签与 unknown 计数），回收
+  判定里保护 unknown。见 `tests/test_pf_unknown.py`。
+
 ## [1.3.0] — 2026-10-19
 
 本轮把看板从「能用」推到「并发安全 + 可观测」：网页服务补上本机鉴权，采集层加锁并改成单飞，
