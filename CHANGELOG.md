@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.3.0-pf.3] — 2026-10-23
+
+### 修复
+
+**待处理列死卡回车「跳转失败」：restart 与 agent 注册的竞态**
+
+- 问题：「待处理」列虚线卡（pane 已死的 thread）回车后，`thread restart`
+  一返回新 pane id 就立刻 `herdr agent focus <id>`；pane 已创建但它的
+  agent 还要一拍才注册，focus 稳定报 `agent target <id> not found`，TUI
+  表现为「跳转失败」（真机 t-0006 / t-0012 复现；等 3s 后同一 focus 即
+  成功）。
+- 方案：新增 `_agent_focus_when_ready()`（`board/collect.py`），10s 内每
+  0.4s 重试 `agent focus`，仅对 `not found` 重试，其余错误立即上抛、超时
+  带中文报错；`focus_target` 的 legacy 分支改走它。web 端
+  `/api/legacy-restart` 只 restart、不切终端，无需改动。
+- 验证：`tests/test_legacy_threads.py` 新增 `AgentFocusReadyTest` 4 个用例
+  （not-found 重试至成功、其他错误立即传播、超时抛错、legacy 卡 focus
+  经重启路径重试两次），全套 45 测试绿；真机对死卡 t-0012 跑 restart +
+  focus，3.7s 后成功聚焦。
+
 ## [1.3.0-pf.2] — 2026-10-22
 
 PannenetsF fork 补丁版本，配合 herdr-projects 0.2 fork（project+threads 模型，

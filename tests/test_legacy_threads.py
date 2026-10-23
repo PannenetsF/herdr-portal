@@ -221,5 +221,75 @@ class LegacyHpBinTest(unittest.TestCase):
             self.assertIsNone(collect._legacy_hp_bin())
 
 
+class AgentFocusReadyTest(unittest.TestCase):
+    """pf.3 时序修复：restart 后的新 pane agent 注册有延迟，focus 要重试。"""
+
+    def test_retries_not_found_then_succeeds(self):
+        calls = {"n": 0}
+
+        def fake_run(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("agent target wT:p36 not found")
+            return {"result": {}}
+
+        with mock.patch.object(collect, "run_herdr", side_effect=fake_run), \
+             mock.patch.object(collect.time, "sleep"):
+            collect._agent_focus_when_ready("wT:p36")
+        self.assertEqual(calls["n"], 3)
+
+    def test_other_error_propagates_immediately(self):
+        calls = {"n": 0}
+
+        def fake_run(*args, **kwargs):
+            calls["n"] += 1
+            raise RuntimeError("pane closed")
+
+        with mock.patch.object(collect, "run_herdr", side_effect=fake_run), \
+             mock.patch.object(collect.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                collect._agent_focus_when_ready("wT:p9", timeout=0.2)
+        self.assertEqual(calls["n"], 1)
+
+    def test_timeout_raises(self):
+        with mock.patch.object(
+            collect,
+            "run_herdr",
+            side_effect=RuntimeError("agent target wT:p36 not found"),
+        ), mock.patch.object(collect.time, "sleep"), mock.patch.object(
+            collect.time, "monotonic", side_effect=[0.0, 0.0, 11.0]
+        ):
+            with self.assertRaises(RuntimeError):
+                collect._agent_focus_when_ready("wT:p36", timeout=10.0)
+
+    def test_legacy_focus_waits_for_restarted_pane(self):
+        item = {
+            "pane_id": "legacy:demo:t-0001",
+            "kind": "legacy",
+            "legacy_project": "demo",
+            "legacy_thread": "t-0001",
+        }
+        calls = {"focus": 0}
+
+        def fake_run(*args, **kwargs):
+            if args[:2] == ("agent", "focus"):
+                calls["focus"] += 1
+                if calls["focus"] == 1:
+                    raise RuntimeError("agent target wT:p2 not found")
+                return {"result": {}}
+            raise AssertionError(f"unexpected {args}")
+
+        with mock.patch.object(collect, "collect", return_value={"items": [item]}), \
+             mock.patch.object(
+                 collect, "legacy_restart",
+                 return_value={"pane_id": "wT:p2", "title": "t", "project": "demo"},
+             ), \
+             mock.patch.object(collect, "run_herdr", side_effect=fake_run), \
+             mock.patch.object(collect, "bring_herdr_to_front", return_value=True), \
+             mock.patch.object(collect.time, "sleep"):
+            collect.focus_target("legacy:demo:t-0001")
+        self.assertEqual(calls["focus"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

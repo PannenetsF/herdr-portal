@@ -1217,6 +1217,28 @@ def bring_herdr_to_front() -> bool:
         return False
 
 
+def _agent_focus_when_ready(pane_id: str, timeout: float = 10.0) -> dict[str, Any]:
+    """`agent focus` a freshly (re)started pane.
+
+    `thread restart` returns the new pane id as soon as the pane exists, but
+    its agent is registered a beat later; focusing immediately fails with
+    "agent target <id> not found". Retry focus itself until the target
+    registers (or the deadline passes); every other error propagates.
+    """
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            return run_herdr("agent", "focus", pane_id)
+        except RuntimeError as exc:
+            last = str(exc)
+            # Anything other than a not-yet-registered target is a real error.
+            if "not found" not in last:
+                raise
+            time.sleep(0.4)
+    raise RuntimeError(f"新 pane {pane_id} 的 agent 未在 {timeout:.0f}s 内就绪：{last}")
+
+
 def focus_target(pane_id: str) -> dict[str, Any]:
     if not pane_id or not SAFE_ID_RE.match(pane_id):
         raise ValueError(f"invalid pane id: {pane_id}")
@@ -1236,7 +1258,7 @@ def focus_target(pane_id: str) -> dict[str, Any]:
             new_pid = restarted.get("pane_id")
             if not new_pid:
                 raise RuntimeError(f"thread restart 出但无 pane_id · {slug}/{tid}")
-            target_result = run_herdr("agent", "focus", new_pid)
+            target_result = _agent_focus_when_ready(new_pid)
             bring_herdr_to_front()
             return target_result
         result = run_herdr("agent", "focus", pane_id)
