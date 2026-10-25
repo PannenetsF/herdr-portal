@@ -18,9 +18,31 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
-from logutil import note  # noqa: E402 - 同目录模块（board/ 已在 sys.path 上）
+from logutil import note, runtime_dir  # noqa: E402 - 同目录模块（board/ 已在 sys.path 上）
 
 HERDR_BIN = os.environ.get("HERDR_BIN_PATH", "herdr")
+
+# pf.4：多机聚合。本机永远叫 LOCAL；远端标签来自 `herdr machine list`。
+# 各台机器的 pane_id 都从 w1:p1 重新编号，所以内存索引 / 选中态 / 磁盘缓存
+# 一律用 (machine, pane_id) 二元组，uid 用 UID_SEP 拼接（\x1f 不会出现在 id 里）。
+LOCAL = "Local"
+UID_SEP = "\x1f"
+
+# 远端快照：单台 6s 超时（SSH/JumpServer MFA 可能挂住），缓存 5s 复用，
+# 超过 REMOTE_FRESH_SECONDS 没刷新成功就把该机器标灰（卡片保留最后一次好数据）。
+REMOTE_TTL = 5.0
+REMOTE_TIMEOUT = 6.0
+REMOTE_FRESH_SECONDS = 15.0
+MACHINE_LIST_TTL = 30.0
+
+
+def card_uid(machine: str, pane_id: str | None) -> str:
+    return f"{machine or LOCAL}{UID_SEP}{pane_id or ''}"
+
+
+def is_local(machine: str | None) -> bool:
+    return not machine or machine == LOCAL
+
 
 STATUS_ORDER = ("blocked", "working", "idle", "done", "unknown")
 
@@ -118,14 +140,24 @@ _collect_gate = threading.Lock()
 _collect_state: tuple[float, dict[str, Any]] | None = None
 
 
-def run_herdr(*args: str, timeout: float = 4.0, allow_empty: bool = False) -> dict[str, Any]:
+def run_herdr(
+    *args: str,
+    machine: str | None = None,
+    timeout: float = 4.0,
+    allow_empty: bool = False,
+) -> dict[str, Any]:
     """跑一条 herdr CLI 命令并解析 JSON。
+
+    `machine` 非 Local 时统一在这里插入 `--machine <label>` 前缀：
+    所有动作（focus / send-text / tab create …）都走这一个口子，
+    调用方不用到处撒条件分支。`herdr machine list` 是本机配置查询，不带前缀。
 
     `allow_empty` 给那些成功时静默（例如 `pane run`）的子命令用：
     退出码为 0 且没有输出时返回空字典，而不是当成失败。
     """
+    prefix = ("--machine", machine) if machine and not is_local(machine) else ()
     completed = subprocess.run(
-        [HERDR_BIN, *args],
+        [HERDR_BIN, *prefix, *args],
         check=False,
         capture_output=True,
         text=True,
@@ -587,12 +619,21 @@ def normalize_item(
     workspaces: dict[str, dict[str, Any]],
     tabs: dict[str, dict[str, Any]],
     now: float,
+    *,
+    machine: str = LOCAL,
+    agent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # agents[] 行比 panes[] 多 state_change_seq；tokens 两边都带，以 agents[] 为准。
+    agent_row = agent if isinstance(agent, dict) else pane
+    machine = machine or LOCAL
+    # 远端 pane 的会话文件在那台机器上，本地 fs 读不到（还可能撞上同名的本地
+    # 路径）：会话解析 / 子代理扫描只对本机做，远端卡片靠快照自带字段渲染。
+    local = is_local(machine)
     agent = pane.get("agent")
     status = pane.get("agent_status") or "unknown"
     session = pane.get("agent_session") or {}
     session_path = session.get("value") if session.get("kind") == "path" else None
-    extra = read_session_extra(session_path) if session_path else {}
+    extra = read_session_extra(session_path) if local and session_path else {}
     workspace = workspaces.get(pane.get("workspace_id") or "", {})
     tab = tabs.get(pane.get("tab_id") or "", {})
     is_agent = bool(agent)
@@ -637,7 +678,7 @@ def normalize_item(
     # herdr 的 agent_status 只描述主 agent 这一回合的生命周期：主 agent 一 yield
     # 就是 idle，未被看过则升级成 done。此时子代理可能还在跑，看板不能报「已完成」。
     background_count = 0
-    if is_agent and session_path and status in {"idle", "done"}:
+    if local and is_agent and session_path and status in {"idle", "done"}:
         background_count, background_at = background_running(session_path, now)
         if background_count:
             status_label = f"后台执行中 · {background_count}"
@@ -648,8 +689,20 @@ def normalize_item(
                 "tone": "working",
             }
             last_active = max(last_active or 0.0, background_at or 0.0)
+    # pf.4：companion herdr-projects ticker 经 tokens 汇报看板语义。
+    # hp_group 存在即「hp 托管」卡；hp_role/hp_audience 在 companion pf.4
+    # 发布前可能整键缺失，下游必须把缺失当成「老 ticker」而不是异常。
+    hp_tokens = agent_row.get("tokens") if isinstance(agent_row.get("tokens"), dict) else {}
+    hp_group = str(hp_tokens.get("hp_group") or "")
+    hp_role = str(hp_tokens.get("hp_role") or "")
+    hp_audience = str(hp_tokens.get("hp_audience") or "")
+    state_change_seq = agent_row.get("state_change_seq")
+    state_change_seq = int(state_change_seq) if isinstance(state_change_seq, int) else None
+    pane_id = pane.get("pane_id")
     return {
-        "id": pane.get("pane_id"),
+        "id": pane_id,
+        "machine": machine,
+        "uid": card_uid(machine, pane_id),
         "kind": "agent" if is_agent else "window",
         "agent": agent or family,
         "agent_label": agent_label,
@@ -695,6 +748,15 @@ def normalize_item(
         "tokens_out": int(extra.get("tokens_out") or 0),
         "revision": pane.get("revision"),
         "background_running": background_count,
+        # base_column：legacy 合流 / 通知中心门控把卡挪进「待处理」前的原列，
+        # 已读撤回时要落回这里，不能靠 status 反推（unknown 也会并进执行中）。
+        "base_column": column,
+        "state_change_seq": state_change_seq,
+        "hp_group": hp_group,
+        "hp_role": hp_role,
+        "hp_audience": hp_audience,
+        "attention_stalled": False,  # audience=stalled：停滞等待，视觉与人的待处理区分
+        "stale": False,  # 所属机器离线，卡片是最后一次好数据
     }
 
 
@@ -755,18 +817,26 @@ def _colors_path() -> Path:
 
 
 def _read_colors() -> dict[str, dict[str, Any]]:
-    """每次分配前重读磁盘：TUI 与 web 服务是两个进程，磁盘是唯一的收敛点。"""
+    """每次分配前重读磁盘：TUI 与 web 服务是两个进程，磁盘是唯一的收敛点。
+
+    pf.4 起键名是 (machine, pane_id) 拼出的 uid；旧文件里的裸 pane_id 是
+    单机时代写的本机槽位，统一搬到 Local 命名空间下继续复用（颜色不跳变）。
+    """
     try:
         raw = json.loads(_colors_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {
-        str(pane_id): record
-        for pane_id, record in raw.items()
-        if isinstance(record, dict) and isinstance(record.get("slot"), int)
-    }
+    records: dict[str, dict[str, Any]] = {}
+    for key, record in raw.items():
+        if not isinstance(record, dict) or not isinstance(record.get("slot"), int):
+            continue
+        key = str(key)
+        if UID_SEP not in key:
+            key = card_uid(LOCAL, key)
+        records[key] = record
+    return records
 
 
 def _write_colors(records: dict[str, dict[str, Any]]) -> None:
@@ -789,9 +859,9 @@ def assign_color_slots(items: list[dict[str, Any]], now: float) -> None:
     global _color_saved_at
     with _MEMO_LOCK:  # 读—改—写 colors.json：TUI 与 web 两个进程也靠它收敛
         records = _read_colors()
-        live_ids = sorted({str(item.get("pane_id") or "") for item in items} - {""})
+        live_ids = sorted({str(item.get("uid") or "") for item in items} - {""})
         live = set(live_ids)
-        by_id = {str(item.get("pane_id") or ""): item for item in items}
+        by_id = {str(item.get("uid") or ""): item for item in items}
         held: dict[int, int] = {}
         for pane_id in live_ids:
             record = records.get(pane_id)
@@ -826,6 +896,8 @@ def assign_color_slots(items: list[dict[str, Any]], now: float) -> None:
 def _fingerprint(snapshot: dict[str, Any]) -> str:
     items = [
         {
+            "uid": item.get("uid"),
+            "machine": item.get("machine"),
             "pane_id": item.get("pane_id"),
             "kind": item.get("kind"),
             "agent": item.get("agent"),
@@ -853,6 +925,9 @@ def _fingerprint(snapshot: dict[str, Any]) -> str:
             "legacy_project": item.get("legacy_project"),
             "legacy_thread": item.get("legacy_thread"),
             "legacy_group": item.get("legacy_group"),
+            "hp_audience": item.get("hp_audience"),
+            "attention_stalled": item.get("attention_stalled"),
+            "stale": item.get("stale"),
         }
         for item in snapshot.get("items") or []
     ]
@@ -885,72 +960,413 @@ def _optional(context: str, func: Callable[[], Any]) -> Any:
         return None
 
 
-def collect() -> dict[str, Any]:
-    now = time.time()
-    payload = run_herdr("api", "snapshot")
-    snapshot = (payload.get("result") or {}).get("snapshot") or {}
-    workspaces = {item["workspace_id"]: item for item in snapshot.get("workspaces") or [] if item.get("workspace_id")}
-    tabs = {item["tab_id"]: item for item in snapshot.get("tabs") or [] if item.get("tab_id")}
-    panes = snapshot.get("panes") or []
-    items = [normalize_item(pane, workspaces, tabs, now) for pane in panes]
-    items.sort(key=_pane_order_key)  # herdr 快照次序会抖动，排序后卡片位置在刷新间稳定
-    track_pane_activity(panes, now)
+# ---------- pf.4 通知中心：焦点即读，每轮只提醒一次 ----------
+
+# 结构：{machine: {pane_id: 已读 state_change_seq}}。焦点落在 pane 上期间
+# 见到的最大 seq 记成已读；新一轮 seq 超过它、且 audience 回到 human/stalled
+# 时卡片才重新进「待处理」。跨 daemon 重启保留（runtime 目录 0700）。
+_seen: dict[str, dict[str, int]] = {}
+_seen_loaded = False
+_seen_saved_at = 0.0
+
+
+def _seen_path() -> Path:
+    # 复用 daemon 已建好的 runtime 目录（~/.local/state/herdr-portal）：
+    # token / pid / 日志都在这，seen.json 是同一类「跨重启的本机状态」。
+    return runtime_dir() / "seen.json"
+
+
+def _load_seen() -> None:
+    global _seen_loaded
+    with _MEMO_LOCK:
+        if _seen_loaded:
+            return
+        _seen_loaded = True
+        try:
+            raw = json.loads(_seen_path().read_text(encoding="utf-8"))
+        except FileNotFoundError:  # 第一次跑，正常
+            return
+        except (OSError, ValueError) as exc:
+            note(f"读取已读状态失败 {_seen_path()}", exc)
+            return
+        if not isinstance(raw, dict):
+            return
+        for machine, seqs in raw.items():
+            if not isinstance(seqs, dict):
+                continue
+            clean = {
+                str(pane_id): int(seq)
+                for pane_id, seq in seqs.items()
+                if isinstance(seq, int) and not isinstance(seq, bool)
+            }
+            if clean:
+                _seen[str(machine)] = clean
+
+
+def _save_seen(now: float, force: bool = False) -> None:
+    global _seen_saved_at
+    with _MEMO_LOCK:
+        if not force and now - _seen_saved_at < 2.0:
+            return
+        _seen_saved_at = now
+        path = _seen_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(_seen, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            note(f"写已读状态失败 {path}", exc)
+
+
+def update_seen(parts: list[dict[str, Any]], now: float | None = None) -> bool:
+    """焦点即读：每台机器快照里正被聚焦的 agent pane，把当前 seq 记为已读。
+
+    parts 与 assemble_snapshot 同形（{"machine", "snapshot"}）。
+    聚焦判定按机器各自的 focused_pane_id：从看板跳过去和人直接在 herdr
+    里切到该 pane 是等价的，当帧刷新后卡片立刻离开「待处理」。
+    """
+    now = now if now is not None else time.time()
+    with _MEMO_LOCK:
+        _load_seen()
+        dirty = False
+        for part in parts:
+            snap = part.get("snapshot") or {}
+            machine = part.get("machine") or LOCAL
+            focused = snap.get("focused_pane_id")
+            if not focused:
+                continue
+            for agent_row in snap.get("agents") or []:
+                if agent_row.get("pane_id") != focused:
+                    continue
+                seq = agent_row.get("state_change_seq")
+                if not isinstance(seq, int) or isinstance(seq, bool):
+                    continue
+                bucket = _seen.setdefault(machine, {})
+                prev = bucket.get(focused)
+                if prev is None or seq > prev:
+                    bucket[focused] = seq
+                    dirty = True
+        if dirty:
+            _save_seen(now)
+    return dirty
+
+
+def seen_map() -> dict[str, dict[str, int]]:
+    with _MEMO_LOCK:
+        _load_seen()
+        return {machine: dict(seqs) for machine, seqs in _seen.items()}
+
+
+HP_AUDIENCE_HUMAN = "human"
+HP_AUDIENCE_STALLED = "stalled"
+
+
+def hp_attention_eligible(item: dict[str, Any], seen: dict[str, dict[str, int]]) -> bool:
+    """pf.4 通知门控；只管带 hp_audience 的 hp 托管卡，其余一概不碰。
+
+    - audience=internal：永远不进「待处理」（coordinator/thread 内部轮转）；
+    - human/stalled：本轮 state_change_seq 没在聚焦时见过才进；
+      从没见过的 pane（seen 缺键）视为未读；
+    - 没有 hp_audience 键：companion 还停在旧 ticker，本函数返回 False，
+      legacy 0.2 thread 合流给出的 attention 原样保留。
+    """
+    audience = item.get("hp_audience") or ""
+    if audience not in (HP_AUDIENCE_HUMAN, HP_AUDIENCE_STALLED):
+        return False
+    seq = item.get("state_change_seq")
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        return False
+    seen_seq = (seen.get(item.get("machine") or LOCAL) or {}).get(item.get("pane_id"))
+    return seen_seq is None or seq > seen_seq
+
+
+# ---------- pf.4 多机聚合（herdr machine list + 每机快照缓存） ----------
+
+_remote_lock = threading.RLock()
+# label -> {"snapshot", "ok_at", "tried_at", "error", "inflight"}
+_remote_states: dict[str, dict[str, Any]] = {}
+_machine_rows_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+
+def machine_rows(now: float | None = None) -> list[dict[str, Any]]:
+    """`herdr machine list --json`（本机配置查询），30s 缓存；失败保留上次清单。"""
+    global _machine_rows_cache
+    now = now if now is not None else time.time()
+    with _remote_lock:
+        cached = _machine_rows_cache
+        if cached is not None and now - cached[0] < MACHINE_LIST_TTL:
+            return cached[1]
+    try:
+        payload = run_herdr("machine", "list", "--json", timeout=4.0)
+    except Exception as exc:  # noqa: BLE001 - 清单拉不下来绝不能拖垮看板
+        note("herdr machine list 失败", exc)
+        return cached[1] if cached else []
+    rows = [row for row in (payload if isinstance(payload, list) else []) if isinstance(row, dict)]
+    with _remote_lock:
+        _machine_rows_cache = (now, rows)
+    return rows
+
+
+def _machine_enabled(row: dict[str, Any]) -> bool:
+    if row.get("enabled") is False:
+        return False
+    if str(row.get("status") or "").lower() == "disabled":
+        return False
+    return bool(row.get("label"))
+
+
+def _fetch_remote(label: str) -> None:
+    """抓一台远端机器的快照更新缓存。任何失败只记账，绝不清掉最后一次好数据。"""
+    try:
+        payload = run_herdr("api", "snapshot", machine=label, timeout=REMOTE_TIMEOUT)
+        snapshot = (payload.get("result") or {}).get("snapshot") or {}
+        if not isinstance(snapshot, dict) or not snapshot:
+            raise RuntimeError("远端快照为空")
+        ok_at = time.time()
+        with _remote_lock:
+            state = _remote_states.setdefault(label, {})
+            state["snapshot"] = snapshot
+            state["ok_at"] = ok_at
+            state["tried_at"] = ok_at
+            state["error"] = ""
+            state["inflight"] = False
+    except Exception as exc:  # noqa: BLE001 - SSH/JumpServer MFA/超时全走容错
+        note(f"远端机器快照失败 · {label}", exc)
+        with _remote_lock:
+            state = _remote_states.setdefault(label, {})
+            state["tried_at"] = time.time()
+            state["inflight"] = False
+            state["error"] = str(exc)[:200]
+
+
+def refresh_remotes(now: float | None = None, wait_cold: bool = True) -> None:
+    """刷新启用中机器的快照（每机 TTL 5s）。
+
+    - 从没尝试过的机器：本轮并发同步等一次（冷启动至多 ~REMOTE_TIMEOUT），
+      不然首帧永远缺机器；
+    - 有缓存且 TTL 过期：丢守护线程后台刷，采集线程不被 SSH/MFA 挂住，
+      看板继续显示最后一次好数据（由 remote_parts 标灰）。
+    """
+    now = now if now is not None else time.time()
+    rows = machine_rows(now)
+    wanted = {
+        str(row["label"])
+        for row in rows
+        if _machine_enabled(row) and not is_local(str(row["label"]))
+    }
+    cold: list[str] = []
+    stale: list[str] = []
+    with _remote_lock:
+        # 清单里已经摘掉的机器：回收缓存（在飞的刷新等它落地后下次再清）
+        for label in [name for name in _remote_states if name not in wanted]:
+            if not _remote_states[label].get("inflight"):
+                del _remote_states[label]
+        for label in sorted(wanted):
+            state = _remote_states.setdefault(label, {})
+            if "tried_at" not in state:
+                cold.append(label)
+            elif now - float(state.get("tried_at") or 0.0) >= REMOTE_TTL and not state.get("inflight"):
+                stale.append(label)
+                state["inflight"] = True
+    if cold and wait_cold:
+        with ThreadPoolExecutor(max_workers=min(6, max(1, len(cold)))) as pool:
+            list(pool.map(_fetch_remote, cold))
+    for label in stale:
+        threading.Thread(
+            target=_fetch_remote, args=(label,), name=f"portal-remote-{label}", daemon=True
+        ).start()
+
+
+def remote_parts(now: float | None = None) -> list[dict[str, Any]]:
+    """把远端缓存包成 assemble_snapshot 的 part；从未成功过的机器给离线占位。"""
+    now = now if now is not None else time.time()
+    parts: list[dict[str, Any]] = []
+    with _remote_lock:
+        snapshot_states = {label: dict(state) for label, state in _remote_states.items()}
+    for label in sorted(snapshot_states):
+        state = snapshot_states[label]
+        snapshot = state.get("snapshot")
+        if not snapshot:
+            parts.append({
+                "machine": label, "snapshot": None,
+                "status": "offline", "stale": True, "age_label": "",
+                "error": state.get("error") or "尚未连接",
+            })
+            continue
+        age = now - float(state.get("ok_at") or 0.0)
+        offline = age > REMOTE_FRESH_SECONDS
+        parts.append({
+            "machine": label, "snapshot": snapshot,
+            "status": "offline" if offline else "live",
+            "stale": offline,
+            "age_label": human_age(state.get("ok_at"), now) if offline else "",
+            "error": state.get("error") or "",
+        })
+    return parts
+
+
+def _apply_legacy_merge(
+    items: list[dict[str, Any]],
+    legacy_data: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """herdr-projects 0.2 thread 汇合（仅本机）：活卡挪进待处理，死 pane 补虚拟卡。
+
+    返回可能追加了虚拟卡的 items；列归属之后还要过 pf.4 通知门控。
+    """
+    if not legacy_data:
+        return items
+    pane_index = {item["uid"]: item for item in items if is_local(item.get("machine"))}
+    virtuals: list[dict[str, Any]] = []
+    for slug, threads in legacy_data.items():
+        for t in threads:
+            group = t.get("group_token") or ""
+            if group not in LEGACY_ATTENTION_GROUPS:
+                continue
+            pid = t.get("pane_id") or ""
+            live = pane_index.get(card_uid(LOCAL, pid)) if pid else None
+            label = LEGACY_GROUP_LABELS.get(group, group)
+            if live and live.get("kind") == "agent":
+                live["column"] = "attention"
+                live["legacy_project"] = slug
+                live["legacy_thread"] = t.get("id", "")
+                live["legacy_group"] = group
+            if live is None or not pid:
+                virtuals.append(build_virtual_item(
+                    pane_id=f"legacy:{slug}:{t.get('id', '')}",
+                    title=t.get("title") or t.get("id", ""),
+                    status_label=label,
+                    column="attention",
+                    kind="legacy",
+                    workspace_id=t.get("workspace_id") or "",
+                    workspace=t.get("workspace_id") or (slug[:12]),
+                    tab_id=t.get("tab_id") or "",
+                    tab="past pane",
+                    family="legacy",
+                    agent_label=label,
+                    legacy_project=slug,
+                    legacy_thread=t.get("id", ""),
+                    legacy_group=group,
+                ))
+    return items + virtuals
+
+
+def _attention_rank(item: dict[str, Any]) -> int:
+    group = item.get("legacy_group")
+    if group == "waiting-on-you":
+        return 0
+    if group == "ready-for-review":
+        return 1
+    return 2  # pf.4 tokens 门控进来的通知卡
+
+
+def assemble_snapshot(
+    parts: list[dict[str, Any]],
+    now: float | None = None,
+    *,
+    legacy_data: dict[str, list[dict[str, Any]]] | None = None,
+    usage: Any = None,
+    plan: Any = None,
+) -> dict[str, Any]:
+    """纯组装：parts（本机 + 各远端原始快照）→ UI 快照。不调用任何 herdr/磁盘。
+
+    part 形：{"machine", "snapshot"|None, "status": live|offline,
+              "stale", "age_label", "error"}
+    """
+    now = now if now is not None else time.time()
+    items: list[dict[str, Any]] = []
+    local_snapshot: dict[str, Any] = {}
+    raw_workspaces: list[dict[str, Any]] = []
+    raw_tabs: list[dict[str, Any]] = []
+    machines_meta: list[dict[str, Any]] = []
+
+    for part in parts:
+        machine = part.get("machine") or LOCAL
+        snap = part.get("snapshot") or {}
+        stale = bool(part.get("stale"))
+        if machine == LOCAL:
+            local_snapshot = snap
+        workspaces = {w["workspace_id"]: w for w in snap.get("workspaces") or [] if w.get("workspace_id")}
+        tabs = {t["tab_id"]: t for t in snap.get("tabs") or [] if t.get("tab_id")}
+        agents_by_id = {a.get("pane_id"): a for a in snap.get("agents") or [] if a.get("pane_id")}
+        panes = snap.get("panes") or []
+        machine_items = [
+            normalize_item(
+                pane, workspaces, tabs, now,
+                machine=machine, agent=agents_by_id.get(pane.get("pane_id")),
+            )
+            for pane in panes
+        ]
+        machine_items.sort(key=_pane_order_key)  # 机器内部按 pane_id 自然序，刷新不抖
+        for item in machine_items:
+            if stale:
+                item["stale"] = True
+                item["stale_label"] = part.get("age_label") or ""
+        items.extend(machine_items)
+        for workspace in snap.get("workspaces") or []:
+            decorated = dict(workspace)
+            decorated["machine"] = machine
+            raw_workspaces.append(decorated)
+        for tab in snap.get("tabs") or []:
+            decorated = dict(tab)
+            decorated["machine"] = machine
+            raw_tabs.append(decorated)
+        machines_meta.append({
+            "label": machine,
+            "local": is_local(machine),
+            "status": part.get("status") or ("live" if snap else "offline"),
+            "stale": stale,
+            "age_label": part.get("age_label") or "",
+            "error": part.get("error") or "",
+            "agents": sum(1 for i in machine_items if i.get("kind") == "agent"),
+            "windows": sum(1 for i in machine_items if i.get("kind") == "window"),
+        })
+
+    # 静默计时只对本机 pane 有意义（revision 是本机 herdr 的终端内容版本号）
     with _MEMO_LOCK:
         for item in items:
+            if not is_local(item.get("machine")):
+                item["quiet_since"] = None
+                item["quiet_seconds"] = 0
+                item["quiet_label"] = ""
+                continue
             since = (_activity.get(item.get("pane_id")) or {}).get("since")
             item["quiet_since"] = since
             item["quiet_seconds"] = int(max(0.0, now - since)) if since else 0
             item["quiet_label"] = human_age(since, now)
+
     assign_color_slots(items, now)
-    # ── legacy herdr-projects 0.2 thread 汇合 ──
-    legacy_data = _legacy_for_collect()
-    if legacy_data:
-        pane_index: dict[str, dict[str, Any]] = {item["pane_id"]: item for item in items}
-        attention: list[dict[str, Any]] = []
-        for slug, threads in legacy_data.items():
-            for t in threads:
-                group = t.get("group_token") or ""
-                if group not in LEGACY_ATTENTION_GROUPS:
-                    continue
-                pid = t.get("pane_id") or ""
-                live = pane_index.get(pid)
-                label = LEGACY_GROUP_LABELS.get(group, group)
-                if live and live.get("kind") == "agent":
-                    live["column"] = "attention"
-                    live["legacy_project"] = slug
-                    live["legacy_thread"] = t.get("id", "")
-                    live["legacy_group"] = group
-                    if group == "waiting-on-you":
-                        attention.append(live)
-                if live is None or not pid:
-                    virtual = build_virtual_item(
-                        pane_id=f"legacy:{slug}:{t.get('id', '')}",
-                        title=t.get("title") or t.get("id", ""),
-                        status_label=label,
-                        column="attention",
-                        kind="legacy",
-                        workspace_id=t.get("workspace_id") or "",
-                        workspace=t.get("workspace_id") or (slug[:12]),
-                        tab_id=t.get("tab_id") or "",
-                        tab="past pane",
-                        family="legacy",
-                        agent_label=label,
-                        legacy_project=slug,
-                        legacy_thread=t.get("id", ""),
-                        legacy_group=group,
-                    )
-                    attention.append(virtual)
-        # waiting-on-you 先于 ready-for-review（已从 legacy_data 遍历来，
-        # 每个项目按 group 天然有序；显式按 group 重排保证）
-        attention.sort(key=lambda i: 0 if i.get("legacy_group") == "waiting-on-you" else 1)
-        if attention:
-            # 把已标记 attention 的活卡从原列拔出
-            attention_ids = {i["pane_id"] for i in attention}
-            items = [i for i in items if i["pane_id"] not in attention_ids]
-            items = attention + items
-    # ── / legacy ──
+
+    # ── legacy herdr-projects 0.2 thread 汇合（仅本机；远端 hp 语义走 tokens）──
+    items = _apply_legacy_merge(items, legacy_data or {})
+
+    # ── pf.4 通知门控：seen 是 hp 托管卡唯一的入列闸门 ──
+    seen = seen_map()
+    for item in items:
+        if not item.get("hp_group") or not item.get("hp_audience"):
+            continue  # 非 hp 托管 / 旧 ticker：维持 legacy 合流与状态列，不动
+        if hp_attention_eligible(item, seen):
+            item["column"] = "attention"
+            item["attention_stalled"] = item.get("hp_audience") == HP_AUDIENCE_STALLED
+        elif item.get("column") == "attention":
+            item["column"] = item.get("base_column") or "working"
+            item["attention_stalled"] = False
+    # ── / 门控 ──
+
+    # 待处理列整体前置：waiting-on-you → ready-for-review → pf.4 通知卡，组内稳定
+    attention = [item for item in items if item["column"] == "attention"]
+    attention.sort(key=_attention_rank)
+    attention_uids = {item["uid"] for item in attention}
+    items = attention + [item for item in items if item["uid"] not in attention_uids]
+
     counts = {
         "attention": 0,
+        "attention_stalled": 0,
         "blocked": 0,
         "working": 0,
         "idle": 0,
@@ -970,6 +1386,8 @@ def collect() -> dict[str, Any]:
                 counts["background"] += 1
         if item["column"] == "attention":
             counts["attention"] += 1
+            if item.get("attention_stalled"):
+                counts["attention_stalled"] += 1
         elif item["status"] in counts:
             counts[item["status"]] += 1
     columns = {
@@ -979,56 +1397,85 @@ def collect() -> dict[str, Any]:
         "settled": [item for item in items if item["column"] in {"idle", "done"}],
         "window": [item for item in items if item["column"] == "window"],
     }
-    spaces: dict[str, dict[str, Any]] = {}
-    for workspace in snapshot.get("workspaces") or []:
-        wid = workspace.get("workspace_id")
-        spaces[wid] = {
-            "workspace_id": wid,
-            "label": workspace.get("label") or wid,
-            "focused": bool(workspace.get("focused")),
-            "agent_status": workspace.get("agent_status"),
-            "items": [],
-        }
-    for item in items:
-        bucket = spaces.setdefault(
-            item["workspace_id"],
-            {
-                "workspace_id": item["workspace_id"],
-                "label": item["workspace"],
-                "focused": False,
-                "agent_status": None,
+    # workspace 桶按机器命名空间：两台机器都有 w1 也不并桶
+    spaces: dict[tuple[str, str], dict[str, Any]] = {}
+    for part in parts:
+        machine = part.get("machine") or LOCAL
+        for workspace in (part.get("snapshot") or {}).get("workspaces") or []:
+            wid = workspace.get("workspace_id")
+            spaces[(machine, wid)] = {
+                "machine": machine,
+                "workspace_id": wid,
+                "label": workspace.get("label") or wid,
+                "focused": bool(workspace.get("focused")),
+                "agent_status": workspace.get("agent_status"),
                 "items": [],
-            },
-        )
+            }
+    for item in items:
+        key = (item.get("machine") or LOCAL, item.get("workspace_id"))
+        bucket = spaces.setdefault(key, {
+            "machine": key[0],
+            "workspace_id": item.get("workspace_id"),
+            "label": item.get("workspace"),
+            "focused": False,
+            "agent_status": None,
+            "items": [],
+        })
         bucket["items"].append(item)
 
-    # 用量 / 套餐都是增强信息：失败降级成 None，但 debug 模式下留痕
-    usage = _optional("今日用量扫描失败", usage_summary)
-    plan = _optional("套餐余量读取失败", plan_summary)
+    focused = {
+        "machine": LOCAL,
+        "workspace_id": local_snapshot.get("focused_workspace_id"),
+        "tab_id": local_snapshot.get("focused_tab_id"),
+        "pane_id": local_snapshot.get("focused_pane_id"),
+    }
     return {
         "ok": True,
-        "fingerprint": _fingerprint({"items": items, "counts": counts, "focused": {
-            "workspace_id": snapshot.get("focused_workspace_id"),
-            "tab_id": snapshot.get("focused_tab_id"),
-            "pane_id": snapshot.get("focused_pane_id"),
-        }}),
+        "fingerprint": _fingerprint({"items": items, "counts": counts, "focused": focused, "machines": machines_meta}),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "clock": time.strftime("%H:%M:%S"),
-        "version": snapshot.get("version") or "",
-        "focused": {
-            "workspace_id": snapshot.get("focused_workspace_id"),
-            "tab_id": snapshot.get("focused_tab_id"),
-            "pane_id": snapshot.get("focused_pane_id"),
-        },
+        "version": local_snapshot.get("version") or "",
+        "focused": focused,
+        "machines": machines_meta,
         "counts": counts,
         "items": items,
         "columns": columns,
         "spaces": list(spaces.values()),
-        "workspaces": snapshot.get("workspaces") or [],
-        "tabs": snapshot.get("tabs") or [],
+        "workspaces": raw_workspaces,
+        "tabs": raw_tabs,
         "usage": usage,
         "plan": plan,
     }
+
+
+def collect() -> dict[str, Any]:
+    now = time.time()
+    payload = run_herdr("api", "snapshot")
+    local_snapshot = (payload.get("result") or {}).get("snapshot") or {}
+    track_pane_activity(local_snapshot.get("panes") or [], now)
+    # 远端机器：冷启动并发等一轮（≤6s）；之后 SSH/MFA 失败只保留缓存，绝不清空看板。
+    # HERDR_PORTAL_REMOTE=0 关掉多机聚合（测试 / 单机排障）。
+    if os.environ.get("HERDR_PORTAL_REMOTE", "1") != "0":
+        _optional("远端机器枚举/快照失败", lambda: refresh_remotes(now))
+    parts: list[dict[str, Any]] = [{
+        "machine": LOCAL,
+        "snapshot": local_snapshot,
+        "status": "live",
+        "stale": False,
+        "age_label": "",
+        "error": "",
+    }]
+    parts.extend(remote_parts(now))
+    # 焦点即读：先记账再组装，聚焦当帧就把卡移出「待处理」。
+    update_seen(parts, now)
+    # 注意：legacy 0.2 的文件式集成（~/.herdr-projects）只在本机跑。
+    # 远端机器的 hp_group/hp_audience 已由那台机器自己的 ticker 写进快照 tokens，
+    # 这里不做 ssh 读远端 root（线程模型/文件格式都不一定一致）。
+    legacy_data = _optional("herdr-projects 线程数据采集失败", _legacy_for_collect) or {}
+    # 用量 / 套餐都是增强信息：失败降级成 None，但 debug 模式下留痕
+    usage = _optional("今日用量扫描失败", usage_summary)
+    plan = _optional("套餐余量读取失败", plan_summary)
+    return assemble_snapshot(parts, now, legacy_data=legacy_data, usage=usage, plan=plan)
 
 
 def collect_or_error(ttl: float = COLLECT_TTL) -> dict[str, Any]:
@@ -1062,6 +1509,7 @@ def _collect_once() -> dict[str, Any]:
             "clock": time.strftime("%H:%M:%S"),
             "counts": {
                 "attention": 0,
+                "attention_stalled": 0,
                 "blocked": 0,
                 "working": 0,
                 "idle": 0,
@@ -1078,13 +1526,27 @@ def _collect_once() -> dict[str, Any]:
         }
 
 
-def send_text(pane_id: str, text: str) -> dict[str, Any]:
+def find_item(snapshot: dict[str, Any], pane_id: str, machine: str | None = None) -> dict[str, Any] | None:
+    """在合并快照里按 (machine, pane_id) 找卡；各机 pane_id 会撞，不能只按 pane_id。"""
+    machine = machine or LOCAL
+    return next(
+        (
+            entry
+            for entry in snapshot.get("items") or []
+            if entry.get("pane_id") == pane_id and (entry.get("machine") or LOCAL) == machine
+        ),
+        None,
+    )
+
+
+def send_text(pane_id: str, text: str, machine: str | None = None) -> dict[str, Any]:
     """Deliver text from the web portal into an agent pane.
 
     Settled agents (blocked/idle/done) get a proper prompt submission;
     working agents get literal typed input so a reply reaches them
     mid-stream without double-delivery risk.
     """
+    machine = machine or LOCAL
     if not pane_id or not SAFE_ID_RE.match(pane_id):
         raise ValueError(f"invalid pane id: {pane_id}")
     message = "".join(
@@ -1097,21 +1559,21 @@ def send_text(pane_id: str, text: str) -> dict[str, Any]:
         raise ValueError("消息过长（上限 20000 字符）")
 
     snapshot = collect()
-    item = next((entry for entry in snapshot["items"] if entry["pane_id"] == pane_id), None)
+    item = find_item(snapshot, pane_id, machine)
     if not item:
-        raise RuntimeError(f"pane 不存在: {pane_id}")
+        raise RuntimeError(f"pane 不存在: {machine}/{pane_id}")
     if item["kind"] != "agent":
         raise RuntimeError("该 Pane 不是 Agent，网页端暂只支持向 Agent 发送文字")
 
     if item["status"] in {"blocked", "idle", "done"}:
-        run_herdr("agent", "prompt", pane_id, message, timeout=20)
-        return {"path": "prompt", "agent": item["agent_label"], "title": item["title"]}
+        run_herdr("agent", "prompt", pane_id, message, machine=machine, timeout=20)
+        return {"path": "prompt", "agent": item["agent_label"], "title": item["title"], "machine": machine}
 
     # herdr 的 pane send-text / send-keys 成功时不打印任何东西（exit 0），
     # 不带 allow_empty 会被 run_herdr 当成失败，文字已经送进 pane 却报错、enter 也不会按下去。
-    run_herdr("pane", "send-text", pane_id, message, timeout=10, allow_empty=True)
-    run_herdr("pane", "send-keys", pane_id, "enter", timeout=10, allow_empty=True)
-    return {"path": "keys", "agent": item["agent_label"], "title": item["title"]}
+    run_herdr("pane", "send-text", pane_id, message, machine=machine, timeout=10, allow_empty=True)
+    run_herdr("pane", "send-keys", pane_id, "enter", machine=machine, timeout=10, allow_empty=True)
+    return {"path": "keys", "agent": item["agent_label"], "title": item["title"], "machine": machine}
 
 
 TERMINAL_APPS = {
@@ -1217,7 +1679,7 @@ def bring_herdr_to_front() -> bool:
         return False
 
 
-def _agent_focus_when_ready(pane_id: str, timeout: float = 10.0) -> dict[str, Any]:
+def _agent_focus_when_ready(pane_id: str, timeout: float = 10.0, machine: str | None = None) -> dict[str, Any]:
     """`agent focus` a freshly (re)started pane.
 
     `thread restart` returns the new pane id as soon as the pane exists, but
@@ -1229,7 +1691,7 @@ def _agent_focus_when_ready(pane_id: str, timeout: float = 10.0) -> dict[str, An
     last = ""
     while time.monotonic() < deadline:
         try:
-            return run_herdr("agent", "focus", pane_id)
+            return run_herdr("agent", "focus", pane_id, machine=machine)
         except RuntimeError as exc:
             last = str(exc)
             # Anything other than a not-yet-registered target is a real error.
@@ -1239,15 +1701,17 @@ def _agent_focus_when_ready(pane_id: str, timeout: float = 10.0) -> dict[str, An
     raise RuntimeError(f"新 pane {pane_id} 的 agent 未在 {timeout:.0f}s 内就绪：{last}")
 
 
-def focus_target(pane_id: str) -> dict[str, Any]:
+def focus_target(pane_id: str, machine: str | None = None) -> dict[str, Any]:
+    machine = machine or LOCAL
     if not pane_id or not SAFE_ID_RE.match(pane_id):
         raise ValueError(f"invalid pane id: {pane_id}")
     snapshot = collect()
-    item = next((entry for entry in snapshot["items"] if entry["pane_id"] == pane_id), None)
+    item = find_item(snapshot, pane_id, machine)
     if not item:
-        raise RuntimeError(f"pane not found: {pane_id}")
+        raise RuntimeError(f"pane not found: {machine}/{pane_id}")
     if item["kind"] in {"agent", "legacy"}:
         if item["kind"] == "legacy":
+            # legacy 虚拟卡只在本机（0.2 文件式集成是 local-only）
             slug = item.get("legacy_project") or ""
             tid = item.get("legacy_thread") or ""
             if not slug or not tid:
@@ -1261,22 +1725,20 @@ def focus_target(pane_id: str) -> dict[str, Any]:
             target_result = _agent_focus_when_ready(new_pid)
             bring_herdr_to_front()
             return target_result
-        result = run_herdr("agent", "focus", pane_id)
-        bring_herdr_to_front()
+        result = run_herdr("agent", "focus", pane_id, machine=machine)
+        # 远端机器没有「本地终端置前」可言；只对本机做 macOS 前台化。
+        if is_local(machine):
+            bring_herdr_to_front()
         return result
     if item.get("workspace_id"):
-        run_herdr("workspace", "focus", item["workspace_id"])
+        run_herdr("workspace", "focus", item["workspace_id"], machine=machine)
     if item.get("tab_id"):
-        run_herdr("tab", "focus", item["tab_id"])
-    subprocess.run(
-        [HERDR_BIN, "pane", "zoom", pane_id, "--on"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=3,
-    )
-    result = run_herdr("pane", "zoom", pane_id, "--off")
-    bring_herdr_to_front()
+        run_herdr("tab", "focus", item["tab_id"], machine=machine)
+    # zoom --on 原来直接拼 argv，这里也收进 run_herdr 的 machine 前缀口子
+    run_herdr("pane", "zoom", pane_id, "--on", machine=machine, timeout=5.0, allow_empty=True)
+    result = run_herdr("pane", "zoom", pane_id, "--off", machine=machine, allow_empty=True)
+    if is_local(machine):
+        bring_herdr_to_front()
     return result
 
 
@@ -1419,9 +1881,11 @@ def build_virtual_item(
     legacy_thread: str = "",
     legacy_group: str = "",
 ) -> dict[str, Any]:
-    """构建一个 45-key 虚拟卡片（与 normalize_item 同构）。"""
+    """构建一个与 normalize_item 同构的虚拟卡片（legacy 死 pane 复活卡）。"""
     return {
         "id": pane_id,
+        "machine": LOCAL,
+        "uid": card_uid(LOCAL, pane_id),
         "kind": kind,
         "agent": family or kind,
         "agent_label": agent_label or status_label,
@@ -1466,6 +1930,17 @@ def build_virtual_item(
         "tokens_out": 0,
         "revision": None,
         "background_running": 0,
+        "base_column": column,
+        "state_change_seq": None,
+        "hp_group": "",
+        "hp_role": "",
+        "hp_audience": "",
+        "attention_stalled": False,
+        "stale": False,
+        "stale_label": "",
+        "quiet_since": None,
+        "quiet_seconds": 0,
+        "quiet_label": "",
         "legacy_project": legacy_project,
         "legacy_thread": legacy_thread,
         "legacy_group": legacy_group,
@@ -1589,20 +2064,26 @@ def track_pane_activity(panes: list[dict[str, Any]], now: float) -> None:
             _save_activity(now)
 
 
-def _process_info(pane_id: str) -> dict[str, Any] | None:
+def _process_info(pane_id: str, machine: str | None = None) -> dict[str, Any] | None:
     try:
-        payload = run_herdr("pane", "process-info", "--pane", pane_id, timeout=3.0)
+        payload = run_herdr("pane", "process-info", "--pane", pane_id, machine=machine, timeout=3.0)
     except (RuntimeError, OSError, subprocess.SubprocessError):
         return None
     info = (payload.get("result") or {}).get("process_info")
     return info if isinstance(info, dict) else None
 
 
-def _process_info_map(pane_ids: list[str]) -> dict[str, dict[str, Any] | None]:
-    if not pane_ids:
+def _process_info_map(targets: list[tuple[str, str]]) -> dict[str, dict[str, Any] | None]:
+    """targets 是 (machine, pane_id) 列表；返回 {uid: process_info}。"""
+    if not targets:
         return {}
-    with ThreadPoolExecutor(max_workers=min(8, len(pane_ids))) as pool:
-        return dict(zip(pane_ids, pool.map(_process_info, pane_ids)))
+
+    def _one(target: tuple[str, str]) -> tuple[str, dict[str, Any] | None]:
+        machine, pane_id = target
+        return card_uid(machine, pane_id), _process_info(pane_id, machine)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+        return dict(pool.map(_one, targets))
 
 
 def _foreground_summary(info: dict[str, Any] | None) -> tuple[list[str], str, bool]:
@@ -1635,14 +2116,21 @@ def _is_portal_pane(info: dict[str, Any] | None) -> bool:
 def _reclaim_verdict(
     item: dict[str, Any],
     info: dict[str, Any] | None,
-    focused_pane_id: str | None,
+    focused_key: tuple[str | None, str | None],
 ) -> tuple[str, str, str, str]:
     """(verdict, risk, reason, process_label)；verdict 为 candidate / protected。"""
     _, process_label, shell_only = _foreground_summary(info)
-    if item.get("focused") or item.get("pane_id") == focused_pane_id:
+    item_key = (item.get("machine"), item.get("pane_id"))
+    if item.get("focused") or item_key == focused_key:
         return "protected", "", "当前聚焦", process_label
+    if item.get("stale"):
+        # 机器离线：卡片是缓存残影，process-info 也读不到，绝不能对着旧数据关 pane
+        return "protected", "", "机器离线 · 缓存数据", process_label
     if item.get("kind") in {"legacy", "window"} and item.get("kind") != "agent":
         return "protected", "", "外部数据 · 非实体会话", process_label
+    if info is None:
+        # 远端探活失败 / 读不到进程表：保守保护，宁可漏回收不可误杀
+        return "protected", "", "进程信息不可用", process_label
     if _is_portal_pane(info):
         return "protected", "", "看板自身", process_label
     if item.get("kind") == "agent":
@@ -1661,29 +2149,58 @@ def _reclaim_verdict(
     return "candidate", "shell", "静止 Shell", process_label
 
 
+def _normalize_targets(pane_ids: list[Any]) -> list[tuple[str, str]]:
+    """cleanup 入参兼容三种写法：裸 pane_id（Local）/ (machine, id) / {pane_id, machine}。"""
+    targets: list[tuple[str, str]] = []
+    for entry in pane_ids or []:
+        if isinstance(entry, dict):
+            pane_id = str(entry.get("pane_id") or "")
+            machine = str(entry.get("machine") or LOCAL)
+        elif isinstance(entry, (list, tuple)):
+            pane_id = str(entry[0] if entry else "")
+            machine = str(entry[1] if len(entry) > 1 and entry[1] else LOCAL)
+        else:
+            pane_id = str(entry)
+            machine = LOCAL
+        if pane_id.strip():
+            targets.append((machine, pane_id))
+    return targets
+
+
 def cleanup_scan(idle_seconds: int = DEFAULT_CLEANUP_IDLE) -> dict[str, Any]:
     """列出可以安全回收的 pane。只读，不做任何关闭动作。"""
     idle_seconds = max(0, int(idle_seconds))
     snapshot = collect()
     items = snapshot.get("items") or []
-    focused_pane_id = (snapshot.get("focused") or {}).get("pane_id")
-    focused_tab_id = (snapshot.get("focused") or {}).get("tab_id")
-    infos = _process_info_map([item["pane_id"] for item in items if item.get("pane_id")])
+    focused = snapshot.get("focused") or {}
+    focused_key = (focused.get("machine") or LOCAL, focused.get("pane_id"))
+    focused_tab_key = (focused.get("machine") or LOCAL, focused.get("tab_id"))
+    targets = [
+        (item.get("machine") or LOCAL, item["pane_id"])
+        for item in items
+        if item.get("pane_id")
+    ]
+    infos = _process_info_map(targets)
 
-    tab_total: dict[str, int] = {}
-    workspace_total: dict[str, int] = {}
+    tab_total: dict[tuple[str, str], int] = {}
+    workspace_total: dict[tuple[str, str], int] = {}
     for item in items:
-        tab_total[item.get("tab_id")] = tab_total.get(item.get("tab_id"), 0) + 1
-        workspace_total[item.get("workspace_id")] = workspace_total.get(item.get("workspace_id"), 0) + 1
+        tab_key = (item.get("machine"), item.get("tab_id"))
+        ws_key = (item.get("machine"), item.get("workspace_id"))
+        tab_total[tab_key] = tab_total.get(tab_key, 0) + 1
+        workspace_total[ws_key] = workspace_total.get(ws_key, 0) + 1
 
     candidates: list[dict[str, Any]] = []
     protected: list[dict[str, Any]] = []
     for item in items:
         pane_id = item.get("pane_id")
-        info = infos.get(pane_id)
-        verdict, risk, reason, process_label = _reclaim_verdict(item, info, focused_pane_id)
+        machine = item.get("machine") or LOCAL
+        info = infos.get(item.get("uid"))
+        verdict, risk, reason, process_label = _reclaim_verdict(item, info, focused_key)
         quiet_seconds = float(item.get("quiet_seconds") or 0.0)
         entry = {
+            "uid": item.get("uid"),
+            "machine": machine,
             "pane_id": pane_id,
             "kind": item.get("kind"),
             "agent_label": item.get("agent_label"),
@@ -1705,9 +2222,9 @@ def cleanup_scan(idle_seconds: int = DEFAULT_CLEANUP_IDLE) -> dict[str, Any]:
             {
                 "risk": risk,
                 "idle_ok": quiet_seconds >= idle_seconds,
-                "in_focused_tab": bool(focused_tab_id) and item.get("tab_id") == focused_tab_id,
-                "last_in_tab": tab_total.get(item.get("tab_id"), 0) <= 1,
-                "last_in_workspace": workspace_total.get(item.get("workspace_id"), 0) <= 1,
+                "in_focused_tab": (machine, item.get("tab_id")) == focused_tab_key,
+                "last_in_tab": tab_total.get((machine, item.get("tab_id")), 0) <= 1,
+                "last_in_workspace": workspace_total.get((machine, item.get("workspace_id")), 0) <= 1,
             }
         )
         # 默认只勾选「静止 shell + 已超过阈值 + 不在当前标签页」，Agent 一律交给人确认。
@@ -1716,7 +2233,7 @@ def cleanup_scan(idle_seconds: int = DEFAULT_CLEANUP_IDLE) -> dict[str, Any]:
         )
         candidates.append(entry)
 
-    candidates.sort(key=lambda entry: (-entry["quiet_seconds"], entry["pane_id"] or ""))
+    candidates.sort(key=lambda entry: (-entry["quiet_seconds"], entry["uid"] or ""))
     return {
         "ok": True,
         "idle_seconds": idle_seconds,
@@ -1734,41 +2251,56 @@ def cleanup_scan(idle_seconds: int = DEFAULT_CLEANUP_IDLE) -> dict[str, Any]:
     }
 
 
-def cleanup_apply(pane_ids: list[str], idle_seconds: int = DEFAULT_CLEANUP_IDLE) -> dict[str, Any]:
+def cleanup_apply(pane_ids: list[Any], idle_seconds: int = DEFAULT_CLEANUP_IDLE) -> dict[str, Any]:
     """关闭选中的 pane。只会关闭「本次重新扫描仍然是候选」的 pane。
 
     herdr 会级联回收：关掉标签页里最后一个 pane 会连标签页一起收，
     关掉工作区里最后一个标签页会连工作区一起收，所以只需要 pane close。
+    入参支持裸 pane_id（本机）或 {"pane_id", "machine"} / [machine, pane_id]。
     """
-    requested = [str(pane_id) for pane_id in pane_ids or [] if str(pane_id).strip()]
-    invalid = [pane_id for pane_id in requested if not SAFE_ID_RE.match(pane_id)]
+    requested = _normalize_targets(pane_ids)
+    invalid = [pane_id for _machine, pane_id in requested if not SAFE_ID_RE.match(pane_id)]
     if invalid:
         raise ValueError(f"invalid pane id: {invalid[0]}")
     if not requested:
         raise ValueError("没有选中任何 pane")
 
     scan = cleanup_scan(idle_seconds)
-    allowed = {entry["pane_id"] for entry in scan["candidates"]}
-    before_workspaces = {entry["workspace_id"] for entry in scan["candidates"] + scan["protected"]}
-    targets = [pane_id for pane_id in requested if pane_id in allowed]
-    skipped = [pane_id for pane_id in requested if pane_id not in allowed]
+    allowed = {
+        (entry.get("machine") or LOCAL, entry["pane_id"])
+        for entry in scan["candidates"]
+    }
+    before_workspaces = {
+        (entry.get("machine") or LOCAL, entry.get("workspace_id"))
+        for entry in scan["candidates"] + scan["protected"]
+    }
+    targets = [target for target in requested if target in allowed]
+    skipped = [
+        {"machine": machine, "pane_id": pane_id}
+        for machine, pane_id in requested
+        if (machine, pane_id) not in allowed
+    ]
 
-    closed: list[str] = []
+    closed: list[dict[str, str]] = []
     failed: list[dict[str, str]] = []
-    for pane_id in targets:
+    for machine, pane_id in targets:
         try:
-            run_herdr("pane", "close", pane_id, timeout=6.0)
-            closed.append(pane_id)
+            run_herdr("pane", "close", pane_id, machine=machine, timeout=6.0)
+            closed.append({"machine": machine, "pane_id": pane_id})
         except Exception as exc:  # noqa: BLE001 - 单个 pane 失败不影响其余
-            note(f"关闭 pane 失败 {pane_id}", exc)
-            failed.append({"pane_id": pane_id, "error": str(exc)})
+            note(f"关闭 pane 失败 {machine}/{pane_id}", exc)
+            failed.append({"machine": machine, "pane_id": pane_id, "error": str(exc)})
     with _MEMO_LOCK:
-        for pane_id in closed:
-            _activity.pop(pane_id, None)
+        # 静默计时缓存是本机文件状态：只清本机关掉的 pane
+        for machine, pane_id in targets:
+            if is_local(machine):
+                _activity.pop(pane_id, None)
 
     after = collect_or_error()
     after_items = after.get("items") or []
-    after_workspaces = {item.get("workspace_id") for item in after_items}
+    after_workspaces = {
+        (item.get("machine") or LOCAL, item.get("workspace_id")) for item in after_items
+    }
     return {
         "ok": not failed,
         "closed": closed,
@@ -1798,8 +2330,9 @@ def clean_label(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()[:RENAME_MAX]
 
 
-def rename_target(kind: str, target_id: str, label: str) -> dict[str, Any]:
+def rename_target(kind: str, target_id: str, label: str, machine: str | None = None) -> dict[str, Any]:
     """重命名 pane / tab / workspace；pane 传空字符串表示清除自定义标题。"""
+    machine = machine or LOCAL
     if kind not in RENAME_KINDS:
         raise ValueError(f"unsupported rename kind: {kind}")
     target_id = str(target_id or "")
@@ -1809,10 +2342,10 @@ def rename_target(kind: str, target_id: str, label: str) -> dict[str, Any]:
     if not label:
         if kind != "pane":
             raise ValueError(f"{RENAME_LABELS[kind]}不能为空")
-        run_herdr("pane", "rename", target_id, "--clear")
-        return {"kind": kind, "target_id": target_id, "label": "", "cleared": True}
-    run_herdr(kind, "rename", target_id, label)
-    return {"kind": kind, "target_id": target_id, "label": label, "cleared": False}
+        run_herdr("pane", "rename", target_id, "--clear", machine=machine)
+        return {"kind": kind, "target_id": target_id, "label": "", "cleared": True, "machine": machine}
+    run_herdr(kind, "rename", target_id, label, machine=machine)
+    return {"kind": kind, "target_id": target_id, "label": label, "cleared": False, "machine": machine}
 
 
 # ---------- 新开 Tab / Pane ----------
@@ -1825,11 +2358,14 @@ def spawn_tab(
     workspace_id: str | None = None,
     cwd: str | None = None,
     label: str | None = None,
+    machine: str | None = None,
 ) -> dict[str, Any]:
     """新开一个标签页，返回它的根 pane。
 
     默认不抢焦点：看板负责建，跳不跳由调用方决定（失败时不留下半个焦点）。
+    在远端卡片上开 Tab 时整条命令走该机器。
     """
+    machine = machine or LOCAL
     args = ["tab", "create", "--no-focus"]
     if workspace_id:
         if not SAFE_ID_RE.match(workspace_id):
@@ -1840,15 +2376,21 @@ def spawn_tab(
     label = clean_label(label)
     if label:
         args += ["--label", label]
-    result = run_herdr(*args, timeout=10.0).get("result") or {}
+    result = run_herdr(*args, machine=machine, timeout=10.0).get("result") or {}
     pane_id = (result.get("root_pane") or {}).get("pane_id")
     if not pane_id:
         raise RuntimeError("herdr 没有返回新建的 pane")
-    return {"kind": "tab", "pane_id": pane_id, "tab_id": (result.get("tab") or {}).get("tab_id")}
+    return {"kind": "tab", "pane_id": pane_id, "tab_id": (result.get("tab") or {}).get("tab_id"), "machine": machine}
 
 
-def spawn_pane(pane_id: str, direction: str = "right", cwd: str | None = None) -> dict[str, Any]:
+def spawn_pane(
+    pane_id: str,
+    direction: str = "right",
+    cwd: str | None = None,
+    machine: str | None = None,
+) -> dict[str, Any]:
     """在指定 pane 旁边切一个新 pane，返回新 pane。"""
+    machine = machine or LOCAL
     pane_id = str(pane_id or "")
     if not pane_id or not SAFE_ID_RE.match(pane_id):
         raise ValueError(f"invalid pane id: {pane_id}")
@@ -1857,11 +2399,11 @@ def spawn_pane(pane_id: str, direction: str = "right", cwd: str | None = None) -
     args = ["pane", "split", pane_id, "--direction", direction, "--no-focus"]
     if cwd:
         args += ["--cwd", cwd]
-    result = run_herdr(*args, timeout=10.0).get("result") or {}
+    result = run_herdr(*args, machine=machine, timeout=10.0).get("result") or {}
     new_id = (result.get("pane") or {}).get("pane_id")
     if not new_id:
         raise RuntimeError("herdr 没有返回新建的 pane")
-    return {"kind": "pane", "pane_id": new_id, "direction": direction, "source_pane_id": pane_id}
+    return {"kind": "pane", "pane_id": new_id, "direction": direction, "source_pane_id": pane_id, "machine": machine}
 
 
 # ---------- 全局资源清理（Mole / mo clean） ----------
@@ -1873,26 +2415,28 @@ def mo_available() -> bool:
     return shutil.which(MO_BIN) is not None
 
 
-def launch_task(command: list[str], label: str, cwd: str | None = None) -> dict[str, Any]:
+def launch_task(command: list[str], label: str, cwd: str | None = None, machine: str | None = None) -> dict[str, Any]:
     """新开一个 herdr 标签页并在里面跑命令，返回新 pane。
 
     交互式工具（sudo 提示、全屏 UI）必须待在真正的终端里，所以看板只负责
-    起一个标签页把它交出去，不去代管它的输入输出。
+    起一个标签页把它交出去，不去代管它的输入输出。mo clean / 插件更新
+    永远在本机跑（显式传 Local）。
     """
+    machine = machine or LOCAL
     if not command:
         raise ValueError("命令为空")
-    spawned = spawn_tab(cwd=cwd, label=clean_label(label) or "task")
+    spawned = spawn_tab(cwd=cwd, label=clean_label(label) or "task", machine=machine)
     pane_id = spawned["pane_id"]
     try:
-        run_herdr("pane", "run", pane_id, *command, timeout=10.0, allow_empty=True)
+        run_herdr("pane", "run", pane_id, *command, machine=machine, timeout=10.0, allow_empty=True)
     except Exception as exc:  # noqa: BLE001 - 命令没起来就别留下一个空标签页
-        note(f"在 {pane_id} 里执行命令失败", exc)
+        note(f"在 {machine}/{pane_id} 里执行命令失败", exc)
         try:
-            run_herdr("pane", "close", pane_id, timeout=6.0)
+            run_herdr("pane", "close", pane_id, machine=machine, timeout=6.0)
         except Exception as cleanup_exc:  # noqa: BLE001
             note(f"回收空标签页失败 {pane_id}", cleanup_exc)
         raise
-    return {"pane_id": pane_id, "tab_id": spawned["tab_id"], "command": " ".join(command)}
+    return {"pane_id": pane_id, "tab_id": spawned["tab_id"], "machine": machine, "command": " ".join(command)}
 
 
 def mo_clean(dry_run: bool = True) -> dict[str, Any]:

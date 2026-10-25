@@ -444,12 +444,12 @@ class Board:
     def column_items(self, key: str) -> list[dict]:
         return list((self.snapshot.get("columns") or {}).get(key) or [])
 
-    def find_item(self, pane_id: str | None) -> dict | None:
-        if not pane_id:
+    def find_item(self, uid: str | None) -> dict | None:
+        if not uid:
             return None
         for items in self.view_items():
             for item in items:
-                if item.get("pane_id") == pane_id:
+                if item.get("uid") == uid:
                     return item
         return None
 
@@ -481,21 +481,21 @@ class Board:
         row = max(0, min(row, len(items) - 1))
         self.pos[self.view] = [col, row]
         item = items[row]
-        self.selected_id = item.get("pane_id")
+        self.selected_id = item.get("uid")
         return item
 
-    def _locate(self, pane_id: str | None) -> bool:
-        if pane_id:
+    def _locate(self, uid: str | None) -> bool:
+        if uid:
             for col, items in enumerate(self.view_items()):
                 for row, item in enumerate(items):
-                    if item.get("pane_id") == pane_id:
+                    if item.get("uid") == uid:
                         self.pos[self.view] = [col, row]
-                        self.selected_id = pane_id
+                        self.selected_id = uid
                         return True
         for col, items in enumerate(self.view_items()):
             if items:
                 self.pos[self.view] = [col, 0]
-                self.selected_id = items[0].get("pane_id")
+                self.selected_id = items[0].get("uid")
                 return True
         self.pos[self.view] = [0, 0]
         self.selected_id = None
@@ -573,7 +573,7 @@ class Board:
             self.flash("当前没有可选项目")
             return False
         try:
-            focus_target(item["pane_id"])
+            focus_target(item["pane_id"], machine=item.get("machine"))
             return True
         except Exception as exc:  # noqa: BLE001
             self.flash(f"跳转失败 · {exc}", 3.5)
@@ -619,24 +619,27 @@ class Board:
         """
         item = self.selected_item()
         cwd = (item or {}).get("cwd") or None
+        machine = (item or {}).get("machine")
         try:
             if kind == "tab":
-                result = spawn_tab(workspace_id=(item or {}).get("workspace_id"), cwd=cwd)
+                result = spawn_tab(
+                    workspace_id=(item or {}).get("workspace_id"), cwd=cwd, machine=machine,
+                )
             else:
                 if not item:
                     self.flash("先选中一个 pane 再拆分")
                     return False
-                result = spawn_pane(item["pane_id"], direction=direction, cwd=cwd)
+                result = spawn_pane(item["pane_id"], direction=direction, cwd=cwd, machine=machine)
         except Exception as exc:  # noqa: BLE001
             self.flash(f"新开 {SPAWN_LABELS[kind]} 失败 · {exc}", 3.5)
             return False
         try:
-            focus_target(result["pane_id"])
+            focus_target(result["pane_id"], machine=result.get("machine"))
             return True
         except Exception as exc:  # noqa: BLE001 - 已经建出来了，跳转失败不算致命
             logutil.note(f"新开 {SPAWN_LABELS[kind]} 后跳转失败", exc)
             self.refresh(force=True)
-            self._locate(result["pane_id"])
+            self._locate(result.get("uid") or "")
             self.flash(f"已新开 {SPAWN_LABELS[kind]} {result['pane_id']}，但跳转失败", 4.0)
             return False
 
@@ -656,7 +659,7 @@ class Board:
             return
         text = self._rename_current(kind, item)
         self.rename = {
-            "pane_id": item.get("pane_id"),
+            "uid": item.get("uid"),
             "kind": kind,
             "buffer": list(text),
             "cursor": len(text),
@@ -670,7 +673,7 @@ class Board:
         """切换重命名对象（Pane / Tab / Workspace），并载入该对象的当前名字。"""
         if self.rename is None:
             return
-        item = self.find_item(self.rename["pane_id"])
+        item = self.find_item(self.rename["uid"])
         if item is None:
             self.close_rename()
             return
@@ -715,7 +718,7 @@ class Board:
         state = self.rename
         if state is None:
             return
-        item = self.find_item(state["pane_id"])
+        item = self.find_item(state["uid"])
         if item is None:
             self.close_rename()
             self.flash("该 Pane 已经不存在了", 3.0)
@@ -723,8 +726,9 @@ class Board:
         kind = state["kind"]
         target_id = {"pane": "pane_id", "tab": "tab_id", "workspace": "workspace_id"}[kind]
         text = "".join(state["buffer"])
+        machine = item.get("machine")
         try:
-            result = rename_target(kind, item.get(target_id) or "", text)
+            result = rename_target(kind, item.get(target_id) or "", text, machine=machine)
         except Exception as exc:  # noqa: BLE001 - 重命名失败留在面板里，方便改
             state["note"] = f"失败 · {exc}"
             return
@@ -733,13 +737,13 @@ class Board:
             # 卡片标题优先用 pane label：只改 Tab 会在同一张卡上留下两个名字，
             # 所以把这次改名同步写到当前 Pane 的标题上（同一个 Tab 里的其他 Pane 不动）。
             try:
-                rename_target("pane", item.get("pane_id") or "", result["label"])
+                rename_target("pane", item.get("pane_id") or "", result["label"], machine=machine)
                 synced = " · 当前 Pane 标题同步"
             except Exception as exc:  # noqa: BLE001 - Tab 已经改好了，只报告没跟上的那一半
                 synced = f" · Pane 标题没跟上（{exc}）"
         self.close_rename()
         self.refresh(force=True)
-        self._locate(item.get("pane_id"))
+        self._locate(item.get("uid"))
         label = RENAME_LABELS[kind]
         done = f"{label} 已清除" if result["cleared"] else f"{label} 已改为「{result['label']}」"
         self.flash(f"{done}{synced}", 3.0)
@@ -765,7 +769,7 @@ class Board:
             return
         self.reclaim["scan"] = scan
         self.reclaim["chosen"] = {
-            entry["pane_id"] for entry in scan["candidates"] if entry["preselect"]
+            entry["uid"] for entry in scan["candidates"] if entry["preselect"]
         }
         self.reclaim["row"] = min(self.reclaim.get("row", 0), max(0, len(scan["candidates"]) - 1))
         self.reclaim["armed"] = False
@@ -792,19 +796,19 @@ class Board:
         index = self.reclaim["row"] if index is None else index
         if not 0 <= index < len(items):
             return
-        pane_id = items[index]["pane_id"]
+        uid = items[index]["uid"]
         chosen: set[str] = self.reclaim["chosen"]
-        if pane_id in chosen:
-            chosen.discard(pane_id)
+        if uid in chosen:
+            chosen.discard(uid)
         else:
-            chosen.add(pane_id)
+            chosen.add(uid)
         self.reclaim["row"] = index
         self.reclaim["armed"] = False
 
     def reclaim_select_all(self, select: bool) -> None:
         if self.reclaim is None:
             return
-        self.reclaim["chosen"] = {entry["pane_id"] for entry in self.reclaim_candidates()} if select else set()
+        self.reclaim["chosen"] = {entry["uid"] for entry in self.reclaim_candidates()} if select else set()
         self.reclaim["armed"] = False
 
     def reclaim_cycle_threshold(self) -> None:
@@ -820,10 +824,16 @@ class Board:
         """第一次 Enter 只是「上膛」，第二次才真正关闭 pane。"""
         if self.reclaim is None:
             return
-        chosen = sorted(self.reclaim["chosen"])
-        if not chosen:
+        chosen_uids = sorted(self.reclaim["chosen"])
+        if not chosen_uids:
             self.reclaim["note"] = "没有选中任何 pane"
             return
+        # uid 集合 → 带机器标签的目标列表（pane_id 各机都会从 w1:p1 重新编号）
+        by_uid = {entry["uid"]: entry for entry in self.reclaim_candidates()}
+        chosen = [
+            {"pane_id": by_uid[uid]["pane_id"], "machine": by_uid[uid].get("machine") or "Local"}
+            for uid in chosen_uids if uid in by_uid
+        ]
         if not self.reclaim["armed"]:
             self.reclaim["armed"] = True
             self.reclaim["note"] = f"再按一次 Enter 释放 {len(chosen)} 项"
@@ -989,7 +999,19 @@ class Board:
 
         _write(self.stdscr, 1, margin, "HERDR  /  MISSION CONTROL", attr=curses.color_pair(P_ACCENT) | curses.A_BOLD)
         view_name = "AGENT 看板" if self.view == "agents" else "窗口 / TERMINALS"
-        subtitle = f"全局智能体调度 · {view_name}"
+        machines = self.snapshot.get("machines") or []
+        remote_live = [m for m in machines if not m.get("local") and m.get("status") == "live"]
+        remote_off = [m for m in machines if not m.get("local") and m.get("status") != "live"]
+        machine_tail = ""
+        if remote_live:
+            names = "·".join(str(m.get("label")) for m in remote_live[:3])
+            if len(remote_live) > 3:
+                names += f"+{len(remote_live) - 3}"
+            machine_tail = f" · {len(machines)} 机 [{names}]"
+        if remote_off:
+            off_names = "/".join(str(m.get("label")) for m in remote_off[:3])
+            machine_tail += f" · 离线 {off_names}"
+        subtitle = f"全局智能体调度 · {view_name}{machine_tail}"
         current = self.version.get("current")
         if current:
             subtitle += f" · v{current}"
@@ -999,8 +1021,10 @@ class Board:
         total_text = f"{counts.get('agents', 0)} AGENTS  ·  {counts.get('windows', 0)} WINDOWS"
         _right(self.stdscr, 2, right_edge, total_text, curses.color_pair(P_MUTED))
 
+        stalled = int(counts.get("attention_stalled") or 0)
+        attention_label = "待处理" + (f"/停{stalled}" if stalled else "")
         stats = (
-            ("attention", counts.get("attention", 0), "待处理"),
+            ("attention", counts.get("attention", 0), attention_label),
             ("blocked", counts.get("blocked", 0), "待确认"),
             ("working", counts.get("working", 0), "执行中"),
             ("working", counts.get("background", 0), "后台"),
@@ -1140,8 +1164,13 @@ class Board:
                 else P_CARD
             )
         base_attr = curses.color_pair(base_pair)
+        if item.get("stale") and not selected:
+            # 远端离线：卡片是最后一次好数据，整卡压暗提示「缓存残影」
+            base_attr |= curses.A_DIM
         status_attr = curses.color_pair(SELECT_PAIR[key] if selected else CARD_STATUS_PAIR[key]) | curses.A_BOLD
         muted_attr = curses.color_pair(base_pair if selected else P_CARD_MUTED)
+        if item.get("stale") and not selected:
+            muted_attr |= curses.A_DIM
 
         for row in range(y, y + height):
             _write(self.stdscr, row, x, "", width, base_attr, pad=True)
@@ -1180,7 +1209,11 @@ class Board:
                 _write(self.stdscr, y, tag_x, tag, attr=attr)
 
         # 行1：标题（卡片主角）+ 右侧工作区
-        marker = "◆" if selected else ("●" if item.get("focused") else "○")
+        # ◔ = audience=stalled 的待处理（停滞等待，与普通 human 待处理的 ○ 区分开）
+        if item.get("attention_stalled"):
+            marker = "◔"
+        else:
+            marker = "◆" if selected else ("●" if item.get("focused") else "○")
         workspace = item.get("workspace") or ""
         workspace = "" if workspace in {"—", "-"} else _fit(workspace, max(0, (width - 14) // 2))
         title_room = width - 6 - (_width(workspace) + 2 if workspace else 0)
@@ -1207,15 +1240,22 @@ class Board:
         age = _ago(item.get("last_active_label") or item.get("quiet_label") or "")
         tool = item.get("activity_tool") or (item.get("family") or "")
         state_text = f"{status}{f' · {age}' if age else ''} · {tool.upper()}"
+        if item.get("attention_stalled"):
+            state_text += " · 停滞"
+        if item.get("stale"):
+            state_text += f" · 离线{item.get('stale_label') or ''}"
         _write(self.stdscr, y + 3, x + 2, state_text, width - 4, muted_attr)
         pane = item.get("pane_id") or ""
+        machine = item.get("machine") or ""
+        # 远端卡把机器标签压进右下角：[ec2-fyq] w6:p1；本机卡只显示 pane id
+        pane_text = f"[{machine}] {pane}" if machine and machine != "Local" else pane
         pane_room = width - 5 - _width(_fit(state_text, width - 4))
         if pane_room > 4:
             _write(
                 self.stdscr,
                 y + 3,
-                x + width - 2 - _width(_fit(pane, pane_room)),
-                _fit(pane, pane_room),
+                x + width - 2 - _width(_fit(pane_text, pane_room)),
+                _fit(pane_text, pane_room),
                 attr=muted_attr,
             )
 
@@ -1224,7 +1264,7 @@ class Board:
         state = self.rename
         if state is None:
             return
-        item = self.find_item(state["pane_id"])
+        item = self.find_item(state["uid"])
         if item is None:
             self.close_rename()
             return
@@ -1252,7 +1292,8 @@ class Board:
             self.hit_buttons.append((y + 1, y + 1, cursor_x, cursor_x + _width(chip) - 1, f"rename-{kind}"))
             cursor_x += _width(chip) + 1
 
-        location = f"{item.get('workspace') or '—'}  ›  {item.get('tab') or '—'}  ›  {item.get('pane_id')}"
+        machine_prefix = f"[{item.get('machine')}] " if item.get("machine") and item.get("machine") != "Local" else ""
+        location = f"{machine_prefix}{item.get('workspace') or '—'}  ›  {item.get('tab') or '—'}  ›  {item.get('pane_id')}"
         _write(self.stdscr, y + 2, x + 2, location, box_width - 4, muted)
 
         # 输入框：光标处反显，长文本按光标位置右移窗口
@@ -1339,14 +1380,16 @@ class Board:
             index = start + offset
             ry = list_top + offset
             active = index == row_index
-            checked = entry["pane_id"] in chosen
+            checked = entry["uid"] in chosen
             row_attr = curses.color_pair(P_SELECT_ACCENT) | curses.A_BOLD if active else base
             mark_attr = row_attr if active else curses.color_pair(P_CARD_SETTLED if checked else P_CARD_MUTED)
             meta_attr = row_attr if active else muted
             _write(self.stdscr, ry, x + 1, "", box_width - 2, row_attr, pad=True)
             _write(self.stdscr, ry, x + 1, "▸" if active else " ", 1, row_attr | curses.A_BOLD)
             _write(self.stdscr, ry, x + 3, "[✓]" if checked else "[ ]", 3, mark_attr | curses.A_BOLD)
-            meta = f"{entry.get('workspace') or '—'} · {entry['pane_id']} · 静默 {entry.get('quiet_label') or '刚刚'}"
+            machine = entry.get("machine") or "Local"
+            machine_tag = f"[{machine}] " if machine != "Local" else ""
+            meta = f"{machine_tag}{entry.get('workspace') or '—'} · {entry['pane_id']} · 静默 {entry.get('quiet_label') or '刚刚'}"
             meta = _fit(meta, max(0, box_width - 24))
             title_room = box_width - 11 - _width(meta)
             title = entry.get("title") or entry["pane_id"]
@@ -1530,9 +1573,9 @@ class Board:
         # 行3 起：最近输出（多行折行 + PgUp/PgDn 滚动）
         lines = self.context_lines(item, body_width)
         body_rows = max(0, height - 4)
-        signature = (item.get("pane_id"), len(lines), lines[-1] if lines else "")
+        # 选中项或输出变了：回到最新一行，除非用户正停在没有新内容的中段
+        signature = (item.get("uid"), len(lines), lines[-1] if lines else "")
         if signature != self.detail_sig:
-            # 选中项或输出变了：回到最新一行，除非用户正停在没有新内容的中段
             if self.detail_sig is None or self.detail_sig[0] != signature[0] or self.detail_follow:
                 self.detail_follow = True
             self.detail_sig = signature

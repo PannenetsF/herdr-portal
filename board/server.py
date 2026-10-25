@@ -23,6 +23,7 @@ import logutil  # noqa: E402 - 同目录模块（board/ 已在 sys.path 上）
 
 from collect import (  # noqa: E402
     DEFAULT_CLEANUP_IDLE,
+    LOCAL,
     cleanup_apply,
     cleanup_scan,
     collect_or_error,
@@ -229,6 +230,11 @@ class Handler(BaseHTTPRequestHandler):
         pane_id = payload.get("pane_id") if isinstance(payload, dict) else None
         if isinstance(pane_id, list):
             pane_id = pane_id[0]
+        # 远端卡片的动作必须带上机器标签；缺省一律走本机（老页面/脚本兼容）
+        machine = payload.get("machine") if isinstance(payload, dict) else None
+        if isinstance(machine, list):
+            machine = machine[0]
+        machine = str(machine or LOCAL)
         try:
             if parsed.path == "/api/cleanup":
                 pane_ids = payload.get("pane_ids") if isinstance(payload, dict) else None
@@ -246,7 +252,7 @@ class Handler(BaseHTTPRequestHandler):
                 text = payload.get("text") if isinstance(payload, dict) else None
                 if isinstance(text, list):
                     text = text[0]
-                result = send_text(str(pane_id or ""), str(text or ""))
+                result = send_text(str(pane_id or ""), str(text or ""), machine=machine)
             elif parsed.path == "/api/legacy-restart":
                 slug = payload.get("slug") if isinstance(payload, dict) else None
                 thread_id = payload.get("thread_id") if isinstance(payload, dict) else None
@@ -254,9 +260,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not slug and pane_id and pane_id.startswith("legacy:"):
                     parts = pane_id.split(":", 2)
                     slug, thread_id = parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else ""
+                # legacy 0.2 线程是本机文件式集成，忽略页面传来的任何机器标签
                 result = legacy_restart(str(slug or ""), str(thread_id or "")) or {}
             else:
-                result = focus_target(str(pane_id or ""))
+                result = focus_target(str(pane_id or ""), machine=machine)
             self._json(200, {"ok": True, "result": result})
         except Exception as exc:  # noqa: BLE001
             logutil.note(f"{self.command} {parsed.path} 处理失败", exc)

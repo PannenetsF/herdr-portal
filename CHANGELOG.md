@@ -1,5 +1,46 @@
 # Changelog
 
+## [1.3.0-pf.4] — 2026-10-25
+
+### 新增
+
+**通知中心语义：焦点即读，每轮只提醒一次**
+
+- 问题：hp 托管卡一进 waiting 状态就钉在「待处理」列，看过（聚焦过）也不撤，
+  新一轮工作又没有「新通知」的概念，attention 列噪声越来越大。
+- 方案：runtime 目录新增跨重启状态 `seen.json`（0600，结构
+  `{machine: {pane_id: 已读 state_change_seq}}`）。每个采集 tick，把各机快照里
+  `focused_pane_id` 对应 agent 的 `state_change_seq` 记为已读（从看板跳转与
+  在 herdr 里直接切 pane 等价）。带 `hp_audience` token 的 hp 卡：
+  - `internal` 永不进「待处理」；
+  - `human` / `stalled` 要求当前 `state_change_seq > seen_seq`（从未见过的 pane
+    缺键即未读），聚焦当帧立即撤出，后续轮次 seq 再推进且 audience 回到
+    human/stalled 时作为新通知重现；
+  - `stalled` 用 ◔ 标记 + 「停滞」小标签与普通 human 待处理区分，计数单列。
+  - companion 尚未升级（无 `hp_audience`）时整体退回旧路径：0.2 legacy thread
+    合流与无 token 卡的状态列启发式完全不变，seen 不是它们的闸门。
+- 验证：`tests/test_seen_remote.py` 覆盖聚焦即读、跨重启保留、seq 推进重现、
+  internal 不进列、stalled 标记、旧 ticker 走 legacy 合流。
+
+**聚合已保存的 SSH 机器（多机看板）**
+
+- 方案：采集时枚举 `herdr machine list --json`（30s TTL），对每台 enabled 机器
+  并发抓 `herdr --machine <label> api snapshot`（6s 超时、每机 5s TTL）；
+  冷启动同步等一轮，之后刷新丢守护线程，SSH/JumpServer MFA 失败绝不阻塞或清空
+  看板——保留最后一次好快照，超过 15s 标灰（卡片压暗 + 「离线/龄期」），从未
+  连通的机器给离线占位。所有身份键改为 `(machine, pane_id)`（uid 以 `\x1f`
+  拼接），pane id 各机都从 w1:p1 重新编号也不撞；colors.json 键同步命名空间
+  （旧裸键自动迁入 Local）。卡片、TUI 标题/计数、web 卡片/统计/页脚都显示紧凑
+  机器标签；workspace 桶按机器隔离。全部动作（focus / send-text / prompt /
+  tab create / pane split / rename / close / zoom / process-info）统一经
+  `run_herdr(..., machine=)` 注入 `--machine <label>` 前缀，远端不做本地终端
+  前置化。回收面板按 uid 勾选，离线卡与进程信息不可用的远端卡一律保护。
+  0.2 legacy 文件式集成保持 local-only（远端 hp 语义走快照 tokens）。
+- 环境变量：`HERDR_PORTAL_REMOTE=0` 关闭多机聚合。
+- 验证：新增多机用例覆盖撞号 uid/spaces 隔离、远端 seen 作用域、离线缓存回退、
+  从未连通占位、disabled 机器过滤、argv 前缀路由；真机对 ec2-fyq 冒烟采集成功
+  （本地 29 卡 + 远端 6 卡，uid 全唯一）。
+
 ## [1.3.0-pf.3] — 2026-10-23
 
 ### 修复

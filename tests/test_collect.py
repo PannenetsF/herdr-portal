@@ -291,7 +291,7 @@ class TestSendText(CollectTestCase):
         ) as runner:
             result = collect.send_text("wD:p1", "帮我确认一下")
         self.assertEqual(result["path"], "prompt")
-        runner.assert_called_once_with("agent", "prompt", "wD:p1", "帮我确认一下", timeout=20)
+        runner.assert_called_once_with("agent", "prompt", "wD:p1", "帮我确认一下", machine="Local", timeout=20)
 
     def test_working_agent_gets_typed_into_the_pane(self):
         with mock.patch.object(collect, "collect", return_value=self.snapshot("working")), mock.patch.object(
@@ -302,8 +302,8 @@ class TestSendText(CollectTestCase):
         self.assertEqual(
             runner.call_args_list,
             [
-                mock.call("pane", "send-text", "wD:p1", "补充一句", timeout=10, allow_empty=True),
-                mock.call("pane", "send-keys", "wD:p1", "enter", timeout=10, allow_empty=True),
+                mock.call("pane", "send-text", "wD:p1", "补充一句", machine="Local", timeout=10, allow_empty=True),
+                mock.call("pane", "send-keys", "wD:p1", "enter", machine="Local", timeout=10, allow_empty=True),
             ],
         )
 

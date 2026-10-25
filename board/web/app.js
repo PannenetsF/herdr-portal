@@ -23,7 +23,7 @@ const state = {
   online: false,
   view: "board",
   family: "all",
-  selected: null, // { pane_id, title, agent_label, kind }
+  selected: null, // { uid, pane_id, machine, title, agent_label, kind }
   sending: false,
   outputKey: null,
   lastViewKey: null,
@@ -102,7 +102,7 @@ function families(items) {
 }
 
 function statusIcon(tone) {
-  if (tone === "attention") return ICONS.attention;
+  if (tone === "attention" || tone === "stalled") return ICONS.attention;
   if (tone === "blocked") return ICONS.blocked;
   if (tone === "working") return ICONS.working;
   if (tone === "settled") return ICONS.settled;
@@ -110,15 +110,17 @@ function statusIcon(tone) {
 }
 
 function card(item) {
-  const selected = state.selected && state.selected.pane_id === item.pane_id;
+  const selected = state.selected && state.selected.uid === item.uid;
   const isAgent = item.kind === "agent";
   const isLegacy = item.kind === "legacy";
+  const machine = item.machine || "Local";
+  const isRemote = machine !== "Local";
   const replyBtn = isAgent && !isLegacy
-    ? `<button class="card-reply" data-reply="${esc(item.pane_id)}" title="回复该 Agent" aria-label="回复该 Agent">${ICONS.reply}</button>`
+    ? `<button class="card-reply" data-reply="${esc(item.uid)}" title="回复该 Agent" aria-label="回复该 Agent">${ICONS.reply}</button>`
     : "";
   // 主 agent 空闲但子代理还在跑：视觉上按「执行中」处理，别让人误读成收工
   const tone = item.column === "attention"
-    ? "attention"
+    ? (item.attention_stalled ? "stalled" : "attention")
     : !isAgent
     ? "window"
     : item.background_running
@@ -148,20 +150,27 @@ function card(item) {
     Number.isInteger(item.color_slot) && Number.isInteger(item.color_hue)
       ? ` data-slot="${item.color_slot}" style="--slot-h:${item.color_hue}"`
       : "";
+  // 机器标签：本机不占位，远端卡给一个紧凑 tag（离线时加龄期）
+  const machineTag = isRemote
+    ? `<span class="card-machine ${item.stale ? "offline" : ""}" title="${item.stale ? "机器离线 · 缓存数据" : "远端机器"}">${esc(machine)}${item.stale ? ` · ${esc(item.stale_label || "offline")}` : ""}</span>`
+    : "";
+  const stalledPill = item.attention_stalled ? `<span class="stalled-flag" title="audience=stalled · 停滞等待">停滞</span>` : "";
   return `
-    <article class="card tone-${esc(tone)} ${item.focused ? "focused" : ""} ${selected ? "selected" : ""}"${slotAttrs}
-      data-pane="${esc(item.pane_id)}"
+    <article class="card tone-${esc(tone)} ${item.stale ? "is-stale" : ""} ${item.focused ? "focused" : ""} ${selected ? "selected" : ""}"${slotAttrs}
+      data-card="${esc(item.uid)}"
+      data-machine="${esc(machine)}"
       data-active="${item.activity_active ? "true" : "false"}"
       tabindex="0"
       aria-label="${esc(strongTitle + " · " + item.agent_label + " · " + item.status_label)}"
       title="${esc(item.terminal_title_raw || item.terminal_title || item.title)}">
       <div class="card-head">
         <h3 class="title">${esc(strongTitle)}</h3>
+        ${machineTag}
         ${cornerTag}
       </div>
       ${descHtml}
       <div class="card-meta">
-        <span class="card-pill">${esc(item.status_label)}${item.focused ? " · 当前" : ""}</span>
+        <span class="card-pill">${esc(item.status_label)}${stalledPill}${item.focused ? " · 当前" : ""}</span>
         <span class="card-meta-icon">${statusIcon(tone)}</span>
         <span class="card-meta-text"><strong>${esc(item.workspace)}</strong>${metaParts.length ? `<span>·</span>${esc(metaParts.join(" · "))}` : ""}</span>
         ${replyBtn}
@@ -174,9 +183,13 @@ function card(item) {
 function renderStats(snapshot) {
   const c = snapshot?.counts || {};
   const spaces = snapshot?.spaces || [];
+  const machines = snapshot?.machines || [];
+  const remotes = machines.filter((m) => !m.local);
+  const offline = remotes.filter((m) => m.status !== "live").length;
   const connection = state.online ? "1" : "0";
   $("rail-stats").innerHTML = [
     ["connection", connection, "连接", state.online ? "" : "err"],
+    ["machines", machines.length || 1, "机器", offline ? "err" : ""],
     ["agents", c.agents ?? 0, "Agents", ""],
     ["windows", c.windows ?? 0, "Windows", ""],
     ["workspaces", spaces.length, "Workspaces", ""],
@@ -284,9 +297,13 @@ function renderSpaces(snapshot) {
   $("stage").innerHTML = spaces
     .map((space) => {
       const items = (space.items || []).filter(matches);
+      const machine = space.machine || "Local";
+      const machineTag = machine !== "Local"
+        ? `<span class="space-machine">${esc(machine)}</span>`
+        : "";
       return `
         <section class="space">
-          <h2>${esc(space.label)}${space.focused ? " · 当前" : ""}</h2>
+          <h2>${machineTag}${esc(space.label)}${space.focused ? " · 当前" : ""}</h2>
           <div class="space-grid">${items.length ? items.map(card).join("") : `<div class="empty">没有匹配的 pane</div>`}</div>
         </section>
       `;
@@ -306,10 +323,10 @@ function markOffline(message) {
 function captureScroll() {
   const stage = $("stage");
   const active = document.activeElement;
-  const focusedCard = active?.closest?.("[data-pane]");
+  const focusedCard = active?.closest?.("[data-card]");
   const focus = focusedCard && stage.contains(active)
     ? {
-        paneId: focusedCard.dataset.pane,
+        uid: focusedCard.dataset.card,
         reply: Boolean(active.closest("[data-reply]")),
       }
     : null;
@@ -327,8 +344,8 @@ function captureScroll() {
 function restoreScroll(positions) {
   const stage = $("stage");
   if (positions.focus) {
-    const cardEl = [...stage.querySelectorAll("[data-pane]")]
-      .find((el) => el.dataset.pane === positions.focus.paneId);
+    const cardEl = [...stage.querySelectorAll("[data-card]")]
+      .find((el) => el.dataset.card === positions.focus.uid);
     const focusTarget = positions.focus.reply
       ? cardEl?.querySelector("[data-reply]")
       : cardEl;
@@ -368,7 +385,12 @@ function render(snapshot, force = false) {
   state.snapshot = snapshot;
   $("clock").textContent = snapshot.clock || "--:--:--";
   $("pulse").classList.remove("err");
-  $("meta").textContent = `v${snapshot.version || "?"} · ${snapshot.updated_at || ""}`;
+  const remotes = (snapshot.machines || []).filter((m) => !m.local);
+  const offline = remotes.filter((m) => m.status !== "live");
+  const machineText = remotes.length
+    ? ` · 机器 ${remotes.length}${offline.length ? ` · 离线 ${offline.map((m) => m.label).join("/")}` : ""}`
+    : "";
+  $("meta").textContent = `v${snapshot.version || "?"} · ${snapshot.updated_at || ""}${machineText}`;
   setHeaderStatus();
   if (!$("usage").hidden) renderUsageModal(snapshot.usage, snapshot.plan);
 
@@ -407,28 +429,38 @@ async function load() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const snapshot = await res.json();
     render(snapshot);
-    if (pendingSelect && snapshot.ok && findItem(pendingSelect)) {
-      openComposerFor(pendingSelect);
-      pendingSelect = null;
+    if (pendingSelect && snapshot.ok) {
+      let target = findItem(pendingSelect);
+      if (!target) {
+        // 兼容旧链接 ?select=<pane_id>：pane_id 全局唯一时直接解析
+        const matches = (snapshot.items || []).filter((i) => i.pane_id === pendingSelect);
+        target = matches.length === 1 ? matches[0] : null;
+      }
+      if (target) {
+        openComposerFor(target.uid);
+        pendingSelect = null;
+      }
     }
   } catch (err) {
     render({ ok: false, error: String(err?.message || err), unauthorized: Boolean(err?.unauthorized), clock: new Date().toLocaleTimeString() });
   }
 }
 
-async function focusPane(paneId) {
+async function focusPane(uid) {
+  const item = findItem(uid);
+  if (!item) return;
   await apiFetch("/api/focus", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pane_id: paneId }),
+    body: JSON.stringify({ pane_id: item.pane_id, machine: item.machine || "Local" }),
   });
   load();
 }
 
 /* ---------- 网页端输入 / 回复 ---------- */
 
-function findItem(paneId) {
-  return (state.snapshot?.items || []).find((item) => item.pane_id === paneId) || null;
+function findItem(uid) {
+  return (state.snapshot?.items || []).find((item) => item.uid === uid) || null;
 }
 
 function showComposer() {
@@ -436,14 +468,14 @@ function showComposer() {
 }
 
 function hideComposer() {
-  const paneId = state.selected?.pane_id;
+  const uid = state.selected?.uid;
   $("composer").hidden = true;
   state.outputKey = null;
   $("composer-output").hidden = true;
-  if (paneId) {
+  if (uid) {
     requestAnimationFrame(() => {
-      const cardEl = [...$("stage").querySelectorAll("[data-pane]")]
-        .find((el) => el.dataset.pane === paneId);
+      const cardEl = [...$("stage").querySelectorAll("[data-card]")]
+        .find((el) => el.dataset.card === uid);
       const focusTarget = cardEl?.querySelector("[data-reply]") || cardEl;
       if (!focusTarget) return;
       try {
@@ -458,12 +490,15 @@ function hideComposer() {
 function syncComposer() {
   const input = $("composer-input");
   if (!state.selected) return;
-  const item = findItem(state.selected.pane_id);
+  const item = findItem(state.selected.uid);
   if (!item) {
     hideComposer();
     return;
   }
-  state.selected = { pane_id: item.pane_id, title: item.title, agent_label: item.agent_label, kind: item.kind };
+  state.selected = {
+    uid: item.uid, pane_id: item.pane_id, machine: item.machine || "Local",
+    title: item.title, agent_label: item.agent_label, kind: item.kind,
+  };
   const target = `${item.agent_label} · ${item.title}`;
   $("composer-target").textContent = `发送给 ${target}`;
   if (item.kind !== "agent") {
@@ -485,8 +520,8 @@ function updateOutput(item) {
     return;
   }
   const text = item.last_output || "";
-  const key = `${item.pane_id}\u0000${text.length}\u0000${text.slice(0, 60)}\u0000${text.slice(-60)}`;
-  const firstForSelection = state.outputKey === null || !state.outputKey.startsWith(`${item.pane_id}\u0000`);
+  const key = `${item.uid}\u0000${text.length}\u0000${text.slice(0, 60)}\u0000${text.slice(-60)}`;
+  const firstForSelection = state.outputKey === null || !state.outputKey.startsWith(`${item.uid}\u0000`);
   if (state.outputKey === key) return;
   state.outputKey = key;
   box.hidden = false;
@@ -512,17 +547,24 @@ function setHint(message, kind = "") {
   hint.className = `composer-hint ${kind}`;
 }
 
-function selectPane(paneId) {
-  const item = findItem(paneId);
+function selectedOf(item) {
+  return {
+    uid: item.uid, pane_id: item.pane_id, machine: item.machine || "Local",
+    title: item.title, agent_label: item.agent_label, kind: item.kind,
+  };
+}
+
+function selectPane(uid) {
+  const item = findItem(uid);
   if (!item) return;
-  state.selected = { pane_id: item.pane_id, title: item.title, agent_label: item.agent_label, kind: item.kind };
+  state.selected = selectedOf(item);
   if (state.snapshot) render(state.snapshot, true);
 }
 
-function openComposerFor(paneId) {
-  const item = findItem(paneId);
+function openComposerFor(uid) {
+  const item = findItem(uid);
   if (!item) return;
-  state.selected = { pane_id: item.pane_id, title: item.title, agent_label: item.agent_label, kind: item.kind };
+  state.selected = selectedOf(item);
   state.outputKey = null;
   showComposer();
   syncComposer();
@@ -532,7 +574,7 @@ function openComposerFor(paneId) {
 
 async function sendMessage() {
   if (state.sending || !state.selected) return;
-  const item = findItem(state.selected.pane_id);
+  const item = findItem(state.selected.uid);
   if (!item || item.kind !== "agent") return;
   const text = $("composer-input").value;
   if (!text.trim()) return;
@@ -545,7 +587,7 @@ async function sendMessage() {
     const res = await apiFetch("/api/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pane_id: item.pane_id, text }),
+      body: JSON.stringify({ pane_id: item.pane_id, machine: item.machine || "Local", text }),
     });
     const payload = await res.json();
     if (!res.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${res.status}`);
@@ -623,7 +665,9 @@ function renderCleanup() {
     .map((c) => {
       const riskAgent = c.risk === "agent";
       const quiet = c.quiet_label || `${c.quiet_seconds}s`;
-      const meta = [c.workspace, c.tab, c.pane_id, c.process, `静默 ${quiet}`].filter(Boolean).join(" · ");
+      const machine = c.machine || "Local";
+      const machineTag = machine !== "Local" ? `[${machine}]` : "";
+      const meta = [machineTag, c.workspace, c.tab, c.pane_id, c.process, `静默 ${quiet}`].filter(Boolean).join(" · ");
       const tags = [
         riskAgent ? `<span class="cleanup-tag tag-agent">Agent</span>` : "",
         c.in_focused_tab ? `<span class="cleanup-tag tag-warn">当前标签页</span>` : "",
@@ -632,8 +676,8 @@ function renderCleanup() {
         ? `<span class="cleanup-row-hint">→ 连带释放 workspace ${esc(c.workspace)}</span>`
         : "";
       return `
-        <label class="cleanup-row ${riskAgent ? "risk-agent" : ""}" data-pane="${esc(c.pane_id)}">
-          <input type="checkbox" value="${esc(c.pane_id)}" ${checked.has(c.pane_id) ? "checked" : ""}>
+        <label class="cleanup-row ${riskAgent ? "risk-agent" : ""}" data-card="${esc(c.uid)}">
+          <input type="checkbox" value="${esc(c.uid)}" ${checked.has(c.uid) ? "checked" : ""}>
           <span class="cleanup-row-main">
             <span class="cleanup-row-title">${esc(c.title)}${tags}</span>
             <span class="cleanup-row-meta">${esc(meta)}</span>
@@ -644,9 +688,11 @@ function renderCleanup() {
       `;
     })
     .join("");
-  const protectedList = (scan.protected || []).map((p) => `
-    <li><code>${esc(p.pane_id)}</code><span>${esc(p.title)}</span><em>${esc(p.reason)}</em></li>
-  `).join("");
+  const protectedList = (scan.protected || []).map((p) => {
+    const machine = p.machine || "Local";
+    const machineTag = machine !== "Local" ? `[${esc(machine)}] ` : "";
+    return `<li><code>${machineTag}${esc(p.pane_id)}</code><span>${esc(p.title)}</span><em>${esc(p.reason)}</em></li>`;
+  }).join("");
   $("cleanup-protected").innerHTML = protectedList
     ? `<details class="cleanup-protected-details"><summary>已保护 ${(scan.protected || []).length} 项 · 不会自动释放</summary><ul>${protectedList}</ul></details>`
     : "";
@@ -738,7 +784,7 @@ function setAllCleanup(checked) {
     box.checked = checked;
   });
   state.cleanup.checked = checked
-    ? new Set((state.cleanup.scan?.candidates || []).map((c) => c.pane_id))
+    ? new Set((state.cleanup.scan?.candidates || []).map((c) => c.uid))
     : new Set();
   updateCleanupSelected();
 }
@@ -759,7 +805,7 @@ async function loadCleanupScan() {
   try {
     state.cleanup.scan = await fetchCleanup(state.cleanup.threshold);
     state.cleanup.checked = new Set(
-      (state.cleanup.scan.candidates || []).filter((c) => c.preselect).map((c) => c.pane_id)
+      (state.cleanup.scan.candidates || []).filter((c) => c.preselect).map((c) => c.uid)
     );
     updateCleanupBadge(state.cleanup.scan.counts?.preselected ?? 0);
     renderCleanup();
@@ -807,8 +853,15 @@ function showToast(text) {
 
 async function applyCleanup() {
   if (state.cleanup.applying) return;
-  const paneIds = [...state.cleanup.checked];
-  if (!paneIds.length) return;
+  const uids = [...state.cleanup.checked];
+  if (!uids.length) return;
+  // 勾选态用 uid（各机 pane_id 会撞）；提交前查回 (machine, pane_id)
+  const byUid = new Map((state.cleanup.scan?.candidates || []).map((c) => [c.uid, c]));
+  const targets = uids
+    .map((uid) => byUid.get(uid))
+    .filter(Boolean)
+    .map((c) => ({ pane_id: c.pane_id, machine: c.machine || "Local" }));
+  if (!targets.length) return;
   state.cleanup.applying = true;
   const applyBtn = $("cleanup-apply");
   applyBtn.disabled = true;
@@ -817,7 +870,7 @@ async function applyCleanup() {
     const res = await apiFetch("/api/cleanup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pane_ids: paneIds, idle_seconds: state.cleanup.threshold }),
+      body: JSON.stringify({ pane_ids: targets, idle_seconds: state.cleanup.threshold }),
     });
     const payload = await res.json();
     if (!res.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${res.status}`);
@@ -879,14 +932,14 @@ document.querySelector(".modes").addEventListener("click", (event) => {
   if (state.snapshot) render(state.snapshot);
 });
 
-function activateCard(paneId) {
-  const item = findItem(paneId);
+function activateCard(uid) {
+  const item = findItem(uid);
   if (item && item.kind === "legacy") {
-    legacyRestart(paneId);
+    legacyRestart(item.pane_id);
     return;
   }
-  selectPane(paneId);
-  focusPane(paneId);
+  selectPane(uid);
+  focusPane(uid);
 }
 
 async function legacyRestart(paneId) {
@@ -894,7 +947,8 @@ async function legacyRestart(paneId) {
     const resp = await apiFetch("/api/legacy-restart", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pane_id: paneId }),
+      // legacy 0.2 虚拟卡永远属于本机
+      body: JSON.stringify({ pane_id: paneId, machine: "Local" }),
     });
     if (resp.ok) load(); else showToast("restart 失败");
   } catch (err) {
@@ -909,18 +963,18 @@ $("stage").addEventListener("click", (event) => {
     openComposerFor(reply.dataset.reply);
     return;
   }
-  const cardEl = event.target.closest("[data-pane]");
+  const cardEl = event.target.closest("[data-card]");
   if (!cardEl) return;
-  activateCard(cardEl.dataset.pane);
+  activateCard(cardEl.dataset.card);
 });
 
 $("stage").addEventListener("keydown", (event) => {
   if (event.target.closest("button, textarea, input, a")) return;
   if (event.key !== "Enter" && event.key !== " ") return;
-  const cardEl = event.target.closest("[data-pane]");
+  const cardEl = event.target.closest("[data-card]");
   if (!cardEl) return;
   event.preventDefault();
-  activateCard(cardEl.dataset.pane);
+  activateCard(cardEl.dataset.card);
 });
 
 $("composer-close").addEventListener("click", hideComposer);

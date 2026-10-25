@@ -362,8 +362,54 @@ h1 { margin: 0; font-size: 18px; line-height: 1.2; font-weight: 650; letter-spac
 .card.tone-working { --card-tone: var(--blue); }
 .card.tone-settled { --card-tone: var(--green); }
 .card.tone-attention { --card-tone: var(--attention); }
+.card.tone-stalled { --card-tone: var(--amber); }
 .card.tone-window { --card-tone: var(--violet); }
 .card.tone-unknown { --card-tone: var(--text-3); }
+
+/* pf.4：远端机器标签（紧凑、等宽、弱化）；离线时描红边 */
+.card-machine {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: .03em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+  color: var(--text-2);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+}
+.card-machine.offline {
+  color: var(--rose);
+  border-color: color-mix(in srgb, var(--rose) 45%, var(--border-strong));
+  background: var(--rose-soft, rgba(244, 63, 94, 0.08));
+}
+/* audience=stalled：停滞等待，小标记区别于普通 human 待处理 */
+.stalled-flag {
+  font-size: 9.5px;
+  font-weight: 700;
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: var(--amber);
+  border: 1px solid color-mix(in srgb, var(--amber) 45%, transparent);
+}
+/* 机器离线：整卡是最后一次好数据，压暗 + 虚线边提示「缓存残影」 */
+.card.is-stale { opacity: .62; border-style: dashed; }
+.card.is-stale:hover { opacity: .8; }
+.space-machine {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 650;
+  margin-right: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--text-2);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+}
+.rail-stat.machines b { color: var(--text-1); }
+.rail-stat.machines.err b { color: var(--rose); }
 .card[data-slot] {
   /* 会话标签色：按 pane 固定分配，会话存活期间不变；状态色仍由 pill / 状态图标表达 */
   --card-tone: hsl(var(--slot-h, 200) var(--slot-s, 60%) var(--slot-l, 55%));
